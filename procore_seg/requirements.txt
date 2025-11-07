@@ -1,0 +1,9 @@
+biopython
+fibos
+h5py
+minkowski-engine
+numpy
+pyyaml
+requests
+torch
+tqdm
