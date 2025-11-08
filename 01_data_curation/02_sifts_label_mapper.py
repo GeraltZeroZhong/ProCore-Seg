@@ -13,7 +13,10 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import re
+import string
 
 import requests
 
@@ -72,7 +75,9 @@ def build_graphql_query() -> str:
         "        feature_id\n"
         "        feature_positions {\n"
         "          beg_seq_id\n"
+        "          beg_ins_code\n"
         "          end_seq_id\n"
+        "          end_ins_code\n"
         "        }\n"
         "        related_database_citations {\n"
         "          database_name\n"
@@ -83,6 +88,124 @@ def build_graphql_query() -> str:
         "  }\n"
         "}\n"
     )
+
+
+def _coerce_seq_id(value: object) -> Optional[str]:
+    """Return a stripped string representation of a sequence identifier."""
+
+    if value is None:
+        return None
+    seq = str(value).strip()
+    return seq or None
+
+
+def _extract_seq_number(seq_id: Optional[str]) -> Optional[int]:
+    """Extract the integer portion of a sequence identifier if present."""
+
+    if not seq_id:
+        return None
+
+    match = re.match(r"^[+-]?\d+", seq_id)
+    if not match:
+        return None
+
+    try:
+        return int(match.group())
+    except ValueError:
+        return None
+
+
+def _extract_ins_code(seq_id: Optional[str], ins_code: Optional[object]) -> str:
+    """Determine the insertion code for a residue."""
+
+    if isinstance(ins_code, str) and ins_code.strip():
+        return ins_code.strip()
+
+    if not seq_id:
+        return ""
+
+    match = re.match(r"^[+-]?\d+(?P<code>[A-Za-z]*)$", seq_id)
+    if match:
+        return match.group("code") or ""
+
+    return ""
+
+
+_INS_CODE_ORDER = [""] + list(string.ascii_uppercase)
+
+
+def _expand_ins_codes(start: str, end: str) -> List[str]:
+    """Return the inclusive range of insertion codes between start and end."""
+
+    start = start or ""
+    end = end or ""
+
+    if start == end:
+        return [start]
+
+    if start in _INS_CODE_ORDER and end in _INS_CODE_ORDER:
+        start_idx = _INS_CODE_ORDER.index(start)
+        end_idx = _INS_CODE_ORDER.index(end)
+        step = 1 if start_idx <= end_idx else -1
+        return [
+            _INS_CODE_ORDER[idx]
+            for idx in range(start_idx, end_idx + step, step)
+        ]
+
+    # Fallback for uncommon multi-character or non-standard codes.
+    if start < end:
+        return [start, end]
+    return [start, end]
+
+
+def _iter_residue_positions(
+    beg_seq_id: object,
+    beg_ins_code: object,
+    end_seq_id: object,
+    end_ins_code: object,
+) -> Iterable[Tuple[str, str]]:
+    """Yield residue identifiers spanning a feature range inclusively."""
+
+    beg_seq = _coerce_seq_id(beg_seq_id)
+    end_seq = _coerce_seq_id(end_seq_id)
+    if beg_seq is None or end_seq is None:
+        LOGGER.debug(
+            "Skipping feature range with missing sequence identifiers: %s -> %s",
+            beg_seq_id,
+            end_seq_id,
+        )
+        return
+
+    beg_num = _extract_seq_number(beg_seq)
+    end_num = _extract_seq_number(end_seq)
+    beg_code = _extract_ins_code(beg_seq, beg_ins_code)
+    end_code = _extract_ins_code(end_seq, end_ins_code)
+
+    if beg_num is None or end_num is None:
+        # Unable to determine numeric span; yield the boundary residues only.
+        yield (beg_seq, beg_code)
+        if beg_seq != end_seq or beg_code != end_code:
+            yield (end_seq, end_code)
+        return
+
+    if beg_num > end_num:
+        beg_num, end_num = end_num, beg_num
+        beg_code, end_code = end_code, beg_code
+
+    if beg_num == end_num:
+        for code in _expand_ins_codes(beg_code, end_code):
+            yield (str(beg_num), code)
+        return
+
+    # Start residue
+    yield (str(beg_num), beg_code)
+
+    # Interior residues without insertion codes
+    for seq_num in range(beg_num + 1, end_num):
+        yield (str(seq_num), "")
+
+    # End residue
+    yield (str(end_num), end_code)
 
 
 def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]]:
@@ -154,17 +277,16 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
 
         for feature in raw_features:
             feature_positions = feature.get("feature_positions") or []
-            positions: List[Tuple[int, int]] = []
+            positions: List[Tuple[str, str, str, str]] = []
             for pos in feature_positions:
-                try:
-                    beg = int(pos["beg_seq_id"])
-                    end = int(pos["end_seq_id"])
-                except (KeyError, TypeError, ValueError):
+                beg_seq = _coerce_seq_id(pos.get("beg_seq_id"))
+                end_seq = _coerce_seq_id(pos.get("end_seq_id"))
+                if beg_seq is None or end_seq is None:
                     LOGGER.debug("Skipping malformed feature position: %s", pos)
                     continue
-                if beg > end:
-                    beg, end = end, beg
-                positions.append((beg, end))
+                beg_ins = _extract_ins_code(beg_seq, pos.get("beg_ins_code"))
+                end_ins = _extract_ins_code(end_seq, pos.get("end_ins_code"))
+                positions.append((beg_seq, beg_ins, end_seq, end_ins))
 
             if not positions:
                 continue
@@ -232,10 +354,10 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
 
 def filter_cath_features(
     instances: Sequence[Dict[str, object]], cath_superfamily: Optional[str]
-) -> List[Tuple[str, List[Tuple[int, int]]]]:
+) -> List[Tuple[str, List[Tuple[str, str, str, str]]]]:
     """Filter features to retain only CATH annotations and optional superfamily."""
 
-    cath_ranges: Dict[str, List[Tuple[int, int]]] = {}
+    cath_ranges: Dict[str, List[Tuple[str, str, str, str]]] = {}
     for instance in instances:
         auth_asym_id = instance.get("auth_asym_id")
         if not isinstance(auth_asym_id, str):
@@ -252,15 +374,35 @@ def filter_cath_features(
                 continue
 
             positions = feature.get("positions") or []
-            valid_positions = [pos for pos in positions if isinstance(pos, tuple)]
+            valid_positions = [
+                pos
+                for pos in positions
+                if isinstance(pos, tuple)
+                and len(pos) == 4
+                and pos[0]
+                and pos[2]
+            ]
             if not valid_positions:
                 continue
 
             cath_ranges.setdefault(auth_asym_id, []).extend(valid_positions)
 
-    result: List[Tuple[str, List[Tuple[int, int]]]] = []
+    def _range_sort_key(span: Tuple[str, str, str, str]) -> Tuple[object, ...]:
+        beg_seq, beg_ins, end_seq, end_ins = span
+        beg_num = _extract_seq_number(beg_seq)
+        end_num = _extract_seq_number(end_seq)
+        return (
+            beg_num if beg_num is not None else 10**9,
+            beg_ins or "",
+            end_num if end_num is not None else 10**9,
+            end_ins or "",
+            beg_seq,
+            end_seq,
+        )
+
+    result: List[Tuple[str, List[Tuple[str, str, str, str]]]] = []
     for auth_asym_id, ranges in cath_ranges.items():
-        sorted_ranges = sorted(ranges, key=lambda item: (item[0], item[1]))
+        sorted_ranges = sorted(ranges, key=_range_sort_key)
         result.append((auth_asym_id, sorted_ranges))
 
     result.sort(key=lambda item: item[0])
@@ -268,24 +410,36 @@ def filter_cath_features(
 
 
 def expand_ranges_to_map(
-    ranged: Sequence[Tuple[str, Sequence[Tuple[int, int]]]]
-) -> Dict[Tuple[str, int, str], int]:
+    ranged: Sequence[Tuple[str, Sequence[Tuple[str, str, str, str]]]]
+) -> Dict[Tuple[str, str, str], int]:
     """Expand inclusive ranges to a per-residue binary map."""
 
-    mapping: Dict[Tuple[str, int, str], int] = {}
+    mapping: Dict[Tuple[str, str, str], int] = {}
     for auth_asym_id, ranges in ranged:
-        for beg, end in ranges:
-            for seq_id in range(int(beg), int(end) + 1):
-                mapping[(auth_asym_id, seq_id, "")] = 1
+        for beg_seq, beg_ins, end_seq, end_ins in ranges:
+            for seq_id, ins_code in _iter_residue_positions(
+                beg_seq, beg_ins, end_seq, end_ins
+            ):
+                mapping[(auth_asym_id, seq_id, ins_code)] = 1
 
     return mapping
 
 
-def serialize_map(mapping: Dict[Tuple[str, int, str], int]) -> List[str]:
+def serialize_map(mapping: Dict[Tuple[str, str, str], int]) -> List[str]:
     """Serialize the per-residue map keys to compact string representation."""
 
     entries: List[str] = []
-    for chain, seq_id, ins_code in sorted(mapping.keys(), key=lambda item: (item[0], item[1], item[2])):
+    def _map_sort_key(item: Tuple[str, str, str]) -> Tuple[object, ...]:
+        chain, seq_id, ins_code = item
+        seq_num = _extract_seq_number(seq_id)
+        return (
+            chain,
+            0 if seq_num is not None else 1,
+            seq_num if seq_num is not None else seq_id,
+            ins_code or "",
+        )
+
+    for chain, seq_id, ins_code in sorted(mapping.keys(), key=_map_sort_key):
         entries.append(f"{chain}|{seq_id}|{ins_code}")
     return entries
 
@@ -306,7 +460,7 @@ def write_json(path: Path, payload: Dict[str, object]) -> None:
 
 
 def build_payload(
-    pdb_id: str, cath_superfamily: Optional[str], mapping: Dict[Tuple[str, int, str], int]
+    pdb_id: str, cath_superfamily: Optional[str], mapping: Dict[Tuple[str, str, str], int]
 ) -> Dict[str, object]:
     """Construct a JSON-serializable payload for the given mapping."""
 
