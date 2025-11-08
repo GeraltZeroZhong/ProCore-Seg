@@ -204,7 +204,11 @@ def _iter_residue_positions(
     for seq_num in range(beg_num + 1, end_num):
         yield (str(seq_num), "")
 
-    # End residue
+    # End residue base position (without insertion code)
+    if end_code:
+        yield (str(end_num), "")
+
+    # End residue including insertion code when present
     yield (str(end_num), end_code)
 
 
