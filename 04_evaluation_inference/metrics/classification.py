@@ -254,8 +254,10 @@ def pr_curve_binary(
     if probs_sorted.size == 0:
         return np.array([1.0]), np.array([0.0]), np.array([], dtype=np.float64)
 
-    distinct_mask = np.r_[True, probs_sorted[1:] != probs_sorted[:-1]]
-    threshold_indices = np.flatnonzero(distinct_mask)
+    # ``last_occurrence_mask`` picks the final position of each distinct score so
+    # that cumulative counts include *all* samples sharing the threshold score.
+    last_occurrence_mask = np.r_[probs_sorted[1:] != probs_sorted[:-1], True]
+    threshold_indices = np.flatnonzero(last_occurrence_mask)
     if threshold_indices.size > num_thresholds:
         positions = np.linspace(0, threshold_indices.size - 1, num_thresholds, dtype=int)
         threshold_indices = threshold_indices[positions]
