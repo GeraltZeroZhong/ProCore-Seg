@@ -1,0 +1,26 @@
+# Core scientific stack
+numpy>=1.24,<3.0
+h5py>=3.8,<4.0
+tqdm>=4.66,<5.0
+PyYAML>=6.0,<7.0
+requests>=2.31,<3.0
+
+# Biology & parsing
+biopython>=1.81,<2.0
+
+# PyTorch: install CPU or CUDA wheels appropriate for your system
+torch>=2.2,<2.6
+# MinkowskiEngine: wheels are platform/CUDA-specific; install separately.
+# Recommended:
+#   pip install -U "git+https://github.com/NVIDIA/MinkowskiEngine@v0.6.1"
+# or prebuilt wheels from project docs. The code tolerates absence where not required.
+
+# Evaluation & plotting
+matplotlib>=3.7,<3.10
+pandas>=1.5,<3.0
+
+# Optional: packing density (OSP). If unavailable, tools can fallback when enabled.
+# fibos>=0.1
+
+# Optional: richer tables/CSV handling
+tabulate>=0.9,<1.0
