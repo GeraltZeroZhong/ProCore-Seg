@@ -50,6 +50,58 @@ def setup_logging() -> None:
 _PACKAGE_NAME = "procore_seg_internal.model_architecture"
 
 
+def _json_safe(value):
+    """Return a JSON-serialisable representation of the provided value."""
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def build_checkpoint_meta(voxel_size: float, cfg: dict) -> dict:
+    """Construct a metadata dictionary for persisted checkpoints."""
+
+    import json
+    import platform
+
+    import torch
+
+    try:  # pragma: no cover - optional dependency
+        minkowski_version = getattr(__import__("MinkowskiEngine"), "__version__", "unknown")
+    except ImportError:  # pragma: no cover - MinkowskiEngine optional
+        minkowski_version = "unknown"
+
+    sanitized_cfg = _json_safe(cfg)
+    # Ensure serialisability by round-tripping through JSON where possible.
+    try:
+        sanitized_cfg = json.loads(json.dumps(sanitized_cfg))
+    except TypeError:  # pragma: no cover - defensive fallback
+        sanitized_cfg = _json_safe({key: str(value) for key, value in cfg.items()})
+
+    return {
+        "voxel_size": float(voxel_size),
+        "model": {
+            "in_channels": cfg.get("in_channels", 8),
+            "base_channels": cfg.get("base_channels", 32),
+            "depth": cfg.get("depth", 4),
+            "arch": "SparseAutoencoder",
+        },
+        "train_config": sanitized_cfg,
+        "software_versions": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda if torch.cuda.is_available() else "cpu",
+            "minkowski": minkowski_version,
+        },
+    }
+
+
 def _ensure_architecture_package() -> Tuple[Path, ModuleType]:
     repo_root = Path(__file__).resolve().parents[1]
     module_dir = repo_root / "02_model_architecture"
@@ -187,7 +239,7 @@ def load_checkpoint(
     optimizer: Optional[Optimizer],
     scheduler: Optional[_LRScheduler],
     scaler: Optional[GradScaler],
-) -> Tuple[int, float]:
+) -> Tuple[int, float, Optional[Dict[str, object]]]:
     checkpoint = torch.load(path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state"])
     if optimizer is not None and "optimizer_state" in checkpoint:
@@ -198,7 +250,8 @@ def load_checkpoint(
         scaler.load_state_dict(checkpoint["scaler_state"])
     start_epoch = int(checkpoint.get("epoch", 0)) + 1
     best_metric = float(checkpoint.get("best_metric", math.inf))
-    return start_epoch, best_metric
+    meta = checkpoint.get("meta") if isinstance(checkpoint.get("meta"), dict) else None
+    return start_epoch, best_metric, meta
 
 
 def train_one_epoch(
@@ -357,7 +410,29 @@ def main() -> int:
     best_val = math.inf
     if args.resume is not None and args.resume.is_file():
         LOGGER.info("Resuming from checkpoint %s", args.resume)
-        start_epoch, best_val = load_checkpoint(args.resume, model, optimizer, scheduler, scaler)
+        start_epoch, best_val, resume_meta = load_checkpoint(
+            args.resume, model, optimizer, scheduler, scaler
+        )
+        if isinstance(resume_meta, dict):
+            meta_voxel = resume_meta.get("voxel_size")
+            if meta_voxel is not None:
+                try:
+                    meta_voxel_float = float(meta_voxel)
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    LOGGER.warning("Checkpoint voxel_size metadata malformed: %s", meta_voxel)
+                else:
+                    LOGGER.info("Checkpoint voxel_size=%.4f", meta_voxel_float)
+                    if not math.isclose(
+                        meta_voxel_float,
+                        float(args.voxel_size),
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        LOGGER.warning(
+                            "Checkpoint voxel_size %.4f differs from requested %.4f",
+                            meta_voxel_float,
+                            args.voxel_size,
+                        )
 
     args_dict = vars(args)
     args_dict_serialisable = {k: (str(v) if isinstance(v, Path) else v) for k, v in args_dict.items()}
@@ -393,6 +468,7 @@ def main() -> int:
             "scaler_state": scaler.state_dict() if amp_enabled else None,
             "best_metric": best_val,
             "config": args_dict_serialisable,
+            "meta": build_checkpoint_meta(args.voxel_size, vars(args)),
         }
         save_checkpoint(args.checkpoint_dir / "last.pth", checkpoint_payload)
 
@@ -400,18 +476,24 @@ def main() -> int:
             best_val = val_loss
             checkpoint_payload["best_metric"] = best_val
             save_checkpoint(args.checkpoint_dir / "best.pth", checkpoint_payload)
+            encoder_state_dict = model.get_encoder_state_dict()
             encoder_state = {
                 "epoch": epoch,
-                "state_dict": model.get_encoder_state_dict(),
+                "encoder_state": encoder_state_dict,
+                "state_dict": encoder_state_dict,
                 "config": args_dict_serialisable,
+                "meta": build_checkpoint_meta(args.voxel_size, vars(args)),
             }
             save_checkpoint(args.checkpoint_dir / "encoder_only.pth", encoder_state)
         elif val_loader is None and epoch == args.epochs - 1:
             save_checkpoint(args.checkpoint_dir / "best.pth", checkpoint_payload)
+            encoder_state_dict = model.get_encoder_state_dict()
             encoder_state = {
                 "epoch": epoch,
-                "state_dict": model.get_encoder_state_dict(),
+                "encoder_state": encoder_state_dict,
+                "state_dict": encoder_state_dict,
                 "config": args_dict_serialisable,
+                "meta": build_checkpoint_meta(args.voxel_size, vars(args)),
             }
             save_checkpoint(args.checkpoint_dir / "encoder_only.pth", encoder_state)
 
