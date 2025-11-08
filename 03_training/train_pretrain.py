@@ -51,7 +51,7 @@ _PACKAGE_NAME = "procore_seg_internal.model_architecture"
 
 
 def _ensure_architecture_package() -> Tuple[Path, ModuleType]:
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[1]
     module_dir = repo_root / "02_model_architecture"
     if not module_dir.exists():
         raise FileNotFoundError("02_model_architecture directory not found relative to script")
