@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import platform
 import subprocess
 import sys
 import traceback
@@ -29,6 +30,12 @@ LOGGER = logging.getLogger(__name__)
 
 SIFTS_MODULE_NAME = "_sifts_label_mapper"
 FEATURIZER_MODULE_NAME = "_atom_point_featurizer"
+
+DATASET_SIGNATURE = {
+    "feature_order": ["C", "H", "O", "N", "S", "Other", "SASA", "OSP"],
+    "label_def": "CATH_core_binary",
+    "quantization_note": "voxelization done at training/inference, not stored here",
+}
 
 
 @dataclass(frozen=True)
@@ -405,6 +412,21 @@ def _featurize_via_cli(
                     "element": data["meta_element"].tolist(),
                 },
             }
+            if "provenance_osp_source" in data:
+                payload["provenance"] = {
+                    "osp_source": str(np.asarray(data["provenance_osp_source"]).item()),
+                    "sasa_probe": float(np.asarray(data["provenance_sasa_probe"]).item()),
+                    "sasa_n_points": int(np.asarray(data["provenance_sasa_n_points"]).item()),
+                }
+            if "summary_atoms_heavy" in data:
+                payload["summary"] = {
+                    "atoms_heavy": int(np.asarray(data["summary_atoms_heavy"]).item()),
+                    "atoms_total": int(np.asarray(data["summary_atoms_total"]).item()),
+                    "chains": int(np.asarray(data["summary_chains"]).item()),
+                    "residues": int(np.asarray(data["summary_residues"]).item()),
+                    "waters_skipped": int(np.asarray(data["summary_waters_skipped"]).item()),
+                    "hydrogens_dropped": int(np.asarray(data["summary_hydrogens_dropped"]).item()),
+                }
     finally:
         npz_path.unlink(missing_ok=True)
 
@@ -449,27 +471,35 @@ def write_h5(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tool_versions = {"python": sys.version.split()[0]}
     try:
-        import Bio
-
-        tool_versions["biopython"] = getattr(Bio, "__version__", "unknown")
-    except ImportError:
-        pass
-    try:
-        import h5py as _h5py
-
-        tool_versions["h5py"] = getattr(_h5py, "__version__", "unknown")
-    except ImportError:
-        pass
+        import Bio  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency missing
+        Bio = None  # type: ignore[assignment]
     try:  # pragma: no cover - optional dependency
-        import fibos
+        import fibos  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency missing
+        fibos = None  # type: ignore[assignment]
 
-        version = getattr(fibos, "__version__", None) or getattr(fibos, "VERSION", None)
-        if version:
-            tool_versions["fibos"] = str(version)
-    except ImportError:
-        pass
+    tool_versions = {
+        "python": platform.python_version(),
+        "biopython": getattr(Bio, "__version__", "unknown") if "Bio" in locals() and Bio else "unknown",
+        "h5py": getattr(h5py, "__version__", "unknown"),
+        "fibos": (
+            getattr(fibos, "__version__", None) or getattr(fibos, "VERSION", "unknown")
+            if "fibos" in locals() and fibos is not None
+            else "unknown"
+        ),
+    }
+
+    provenance = payload.get("provenance") if isinstance(payload.get("provenance"), dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+
+    residues_set = set(zip(chains, resseqs, icodes))
+    summary_residues = int(summary.get("residues", len(residues_set)))
+    summary_chains = int(summary.get("chains", len(set(chains))))
+    summary_atoms_heavy = int(summary.get("atoms_heavy", n_atoms))
+    summary_atoms_total = int(summary.get("atoms_total", n_atoms))
+    osp_source = str(provenance.get("osp_source", "unknown"))
 
     dtype_str = h5py.special_dtype(vlen=str)
 
@@ -495,7 +525,13 @@ def write_h5(
             handle.attrs["sasa_probe"] = float(sasa_probe)
             handle.attrs["sasa_n_points"] = int(sasa_n_points)
             handle.attrs["feature_dim"] = features.shape[1]
+            handle.attrs["dataset_signature"] = json.dumps(DATASET_SIGNATURE, sort_keys=True)
             handle.attrs["tool_versions"] = json.dumps(tool_versions, sort_keys=True)
+            handle.attrs["osp_source"] = osp_source
+            handle.attrs["atoms_total"] = summary_atoms_total
+            handle.attrs["atoms_heavy"] = summary_atoms_heavy
+            handle.attrs["residues"] = summary_residues
+            handle.attrs["chains"] = summary_chains
 
         os.replace(tmp_path, out_path)
     except Exception:
@@ -527,6 +563,7 @@ def process_one(args: Tuple) -> Dict[str, object]:
         "atoms": 0,
         "residues": 0,
         "chains": 0,
+        "osp_source": "unknown",
         "error": None,
     }
 
@@ -561,13 +598,19 @@ def process_one(args: Tuple) -> Dict[str, object]:
         meta = payload["meta"]
         chain_ids = list(meta["chain_id"])
         residues_set = set(zip(chain_ids, meta["resseq"], meta["icode"]))
+        provenance = payload.get("provenance") if isinstance(payload.get("provenance"), dict) else {}
+        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        atoms_heavy = int(summary.get("atoms_heavy", coords.shape[0]))
+        residues_count = int(summary.get("residues", len(residues_set)))
+        chains_count = int(summary.get("chains", len(set(chain_ids))))
         result.update(
             {
                 "status": "processed",
                 "h5_path": str(out_path),
-                "atoms": int(coords.shape[0]),
-                "residues": len(residues_set),
-                "chains": len(set(chain_ids)),
+                "atoms": atoms_heavy,
+                "residues": residues_count,
+                "chains": chains_count,
+                "osp_source": str(provenance.get("osp_source", "unknown")),
             }
         )
         return result

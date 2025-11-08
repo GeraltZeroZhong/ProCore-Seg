@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -21,6 +22,7 @@ from .dataset import Batch, set_seed
 from .losses import DensityWeightedCrossEntropy
 from .train_pretrain import (
     _load_architecture_module,
+    build_checkpoint_meta,
     build_dataloaders,
     load_checkpoint,
     save_checkpoint,
@@ -29,6 +31,20 @@ from .train_pretrain import (
 )
 
 LOGGER = logging.getLogger("procore_seg.segment")
+
+DATASET_SIGNATURE = {
+    "feature_order": ["C", "H", "O", "N", "S", "Other", "SASA", "OSP"],
+    "label_def": "CATH_core_binary",
+}
+
+
+def atomic_save(path: Path, obj: Dict[str, object]) -> None:
+    """Atomically persist a checkpoint payload to disk."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 @dataclass
@@ -275,7 +291,30 @@ def main() -> int:
 
     if args.encoder_weights is not None and args.encoder_weights.is_file():
         state = torch.load(args.encoder_weights, map_location="cpu")
-        if "state_dict" in state:
+        meta = state.get("meta") if isinstance(state, dict) else None
+        if isinstance(meta, dict):
+            meta_voxel = meta.get("voxel_size")
+            if meta_voxel is not None:
+                try:
+                    meta_voxel_float = float(meta_voxel)
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    LOGGER.warning("Encoder checkpoint voxel_size metadata malformed: %s", meta_voxel)
+                else:
+                    LOGGER.info("Encoder checkpoint voxel_size=%.4f", meta_voxel_float)
+                    if not math.isclose(
+                        meta_voxel_float,
+                        float(args.voxel_size),
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        LOGGER.warning(
+                            "Encoder checkpoint voxel_size %.4f differs from requested %.4f",
+                            meta_voxel_float,
+                            args.voxel_size,
+                        )
+        if isinstance(state, dict) and "encoder_state" in state:
+            state_dict = state["encoder_state"]
+        elif isinstance(state, dict) and "state_dict" in state:
             state_dict = state["state_dict"]
         else:
             state_dict = state
@@ -298,11 +337,37 @@ def main() -> int:
     best_core_iou = 0.0
     if args.resume is not None and args.resume.is_file():
         LOGGER.info("Resuming from checkpoint %s", args.resume)
-        start_epoch, best_core_iou = load_checkpoint(args.resume, model, optimizer, scheduler, scaler)
+        start_epoch, best_core_iou, resume_meta = load_checkpoint(
+            args.resume, model, optimizer, scheduler, scaler
+        )
+        if isinstance(resume_meta, dict):
+            meta_voxel = resume_meta.get("voxel_size")
+            if meta_voxel is not None:
+                try:
+                    meta_voxel_float = float(meta_voxel)
+                except (TypeError, ValueError):  # pragma: no cover - defensive
+                    LOGGER.warning("Checkpoint voxel_size metadata malformed: %s", meta_voxel)
+                else:
+                    LOGGER.info("Checkpoint voxel_size=%.4f", meta_voxel_float)
+                    if not math.isclose(
+                        meta_voxel_float,
+                        float(args.voxel_size),
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    ):
+                        LOGGER.warning(
+                            "Checkpoint voxel_size %.4f differs from requested %.4f",
+                            meta_voxel_float,
+                            args.voxel_size,
+                        )
 
     density_threshold = args.dwce_T
     args_dict = vars(args)
     args_dict_serialisable = {k: (str(v) if isinstance(v, Path) else v) for k, v in args_dict.items()}
+    best_metrics_dict: Dict[str, float] = {}
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_meta: Optional[Dict[str, object]] = None
+    last_meta: Optional[Dict[str, object]] = None
 
     for epoch in range(start_epoch, args.epochs):
         LOGGER.info("Epoch %d/%d", epoch + 1, args.epochs)
@@ -338,6 +403,25 @@ def main() -> int:
         if scheduler is not None:
             scheduler.step()
 
+        if val_loader is not None:
+            current_metrics = {k: float(v) for k, v in val_metrics.items()}
+            current_metrics["loss"] = float(val_loss)
+        else:
+            current_metrics = {k: float(v) for k, v in train_metrics.items()}
+            current_metrics["loss"] = float(train_loss)
+
+        checkpoint_meta = build_checkpoint_meta(args.voxel_size, vars(args)) | {
+            "model": {
+                "in_channels": int(getattr(seg_cfg, "in_channels", 8)),
+                "base_channels": int(getattr(seg_cfg, "base_channels", 32)),
+                "depth": int(getattr(seg_cfg, "depth", 4)),
+                "num_classes": int(getattr(seg_cfg, "num_classes", 2)),
+                "arch": "SparseSegmentationUNet",
+            },
+            "dataset_signature": DATASET_SIGNATURE,
+        }
+        last_meta = checkpoint_meta
+
         checkpoint_payload = {
             "epoch": epoch,
             "model_state": model.state_dict(),
@@ -345,30 +429,48 @@ def main() -> int:
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "scaler_state": scaler.state_dict() if amp_enabled else None,
             "best_metric": best_core_iou,
+            "best_metrics": dict(best_metrics_dict),
             "config": args_dict_serialisable,
+            "meta": checkpoint_meta,
         }
         save_checkpoint(args.checkpoint_dir / "last.pth", checkpoint_payload)
 
         if val_loader is not None and val_metrics.get("core_iou", 0.0) > best_core_iou:
             best_core_iou = val_metrics["core_iou"]
+            best_metrics_dict = dict(current_metrics)
             checkpoint_payload["best_metric"] = best_core_iou
+            checkpoint_payload["best_metrics"] = dict(best_metrics_dict)
             save_checkpoint(args.checkpoint_dir / "best.pth", checkpoint_payload)
-            final_payload = {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "config": args_dict_serialisable,
-                "best_core_iou": best_core_iou,
-            }
-            save_checkpoint(args.checkpoint_dir / "segmenter_final.pth", final_payload)
+            best_state_dict = model.state_dict()
+            best_meta = checkpoint_meta
         elif val_loader is None and epoch == args.epochs - 1:
+            best_core_iou = current_metrics.get("core_iou", best_core_iou)
+            best_metrics_dict = dict(current_metrics)
+            checkpoint_payload["best_metric"] = best_core_iou
+            checkpoint_payload["best_metrics"] = dict(best_metrics_dict)
             save_checkpoint(args.checkpoint_dir / "best.pth", checkpoint_payload)
-            final_payload = {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "config": args_dict_serialisable,
-                "best_core_iou": best_core_iou,
-            }
-            save_checkpoint(args.checkpoint_dir / "segmenter_final.pth", final_payload)
+            best_state_dict = model.state_dict()
+            best_meta = checkpoint_meta
+
+    if best_state_dict is None:
+        best_state_dict = model.state_dict()
+    if best_meta is None:
+        fallback_meta = build_checkpoint_meta(args.voxel_size, vars(args)) | {
+            "model": {
+                "in_channels": int(getattr(seg_cfg, "in_channels", 8)),
+                "base_channels": int(getattr(seg_cfg, "base_channels", 32)),
+                "depth": int(getattr(seg_cfg, "depth", 4)),
+                "num_classes": int(getattr(seg_cfg, "num_classes", 2)),
+                "arch": "SparseSegmentationUNet",
+            },
+            "dataset_signature": DATASET_SIGNATURE,
+        }
+        best_meta = last_meta or fallback_meta
+    final_payload = {
+        "model_state": best_state_dict,
+        "meta": best_meta,
+    }
+    atomic_save(args.checkpoint_dir / "segmenter_final.pth", final_payload)
 
     histogram_sanity_check(model, val_loader if val_loader is not None else train_loader, device, args.density_feature_idx, density_threshold)
     LOGGER.info("Training completed. Best core IoU: %.4f", best_core_iou)

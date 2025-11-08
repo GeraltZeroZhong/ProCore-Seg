@@ -199,8 +199,10 @@ def _normalize_resseq(resseq) -> int:
         raise StructureParsingError(f"Residue sequence identifier '{resseq}' is invalid") from exc
 
 
-def iter_heavy_atoms(structure: Structure) -> Iterable[Tuple[Atom, str, int, str]]:
-    """Iterate over heavy atoms in the first model of the structure."""
+def collect_heavy_atoms_with_summary(
+    structure: Structure,
+) -> Tuple[List[Tuple[Atom, str, int, str]], Dict[str, int]]:
+    """Return heavy atoms alongside summary statistics for the structure."""
 
     try:
         model = structure[0]
@@ -208,22 +210,26 @@ def iter_heavy_atoms(structure: Structure) -> Iterable[Tuple[Atom, str, int, str
         raise StructureParsingError("Structure does not contain model 0") from exc
 
     selected: List[Tuple[Atom, str, int, str]] = []
-    residues_total = 0
-    residues_used = 0
-    hetero_skipped = 0
-    atoms_total = 0
-    hydrogen_removed = 0
     per_chain_counts: Dict[str, int] = {}
+    chains_seen: Set[str] = set()
+    residues_seen: Set[Tuple[str, int, str]] = set()
+    atoms_total = 0
+    hydrogens_removed = 0
+    waters_skipped = 0
+    hetero_skipped = 0
 
     for chain in model:
         chain_id = str(chain.id)
         for residue in chain:
-            residues_total += 1
             hetflag, resseq_raw, icode_raw = residue.id
             if hetflag not in _ALLOWED_RESIDUE_FLAGS:
-                hetero_skipped += 1
+                resname = (residue.get_resname() or "").strip().upper()
+                if hetflag == "W" or resname in {"HOH", "H2O", "WAT"}:
+                    waters_skipped += 1
+                else:
+                    hetero_skipped += 1
                 continue
-            residues_used += 1
+
             resseq = _normalize_resseq(resseq_raw)
             icode = _normalize_icode(icode_raw)
             best_atoms: Dict[str, Tuple[float, int, str, int, Atom]] = {}
@@ -232,7 +238,7 @@ def iter_heavy_atoms(structure: Structure) -> Iterable[Tuple[Atom, str, int, str
                 atoms_total += 1
                 element = normalize_element(atom)
                 if element.upper() == "H":
-                    hydrogen_removed += 1
+                    hydrogens_removed += 1
                     continue
                 altloc_raw = atom.get_altloc()
                 altloc = "" if altloc_raw in ("", " ") else str(altloc_raw)
@@ -266,20 +272,37 @@ def iter_heavy_atoms(structure: Structure) -> Iterable[Tuple[Atom, str, int, str
                 atom = entry[4]
                 selected.append((atom, chain_id, resseq, icode))
                 per_chain_counts[chain_id] = per_chain_counts.get(chain_id, 0) + 1
+                chains_seen.add(chain_id)
+                residues_seen.add((chain_id, resseq, icode))
 
     LOGGER.debug(
-        "Residues total=%d used=%d (skipped hetero=%d); atoms total=%d heavy=%d; hydrogens removed=%d",
-        residues_total,
-        residues_used,
-        hetero_skipped,
-        atoms_total,
+        "Selected heavy atoms=%d (total atoms processed=%d, hydrogens removed=%d, waters skipped=%d, hetero skipped=%d)",
         len(selected),
-        hydrogen_removed,
+        atoms_total,
+        hydrogens_removed,
+        waters_skipped,
+        hetero_skipped,
     )
     for chain_id in sorted(per_chain_counts):
         LOGGER.debug("Chain %s heavy atom count=%d", chain_id, per_chain_counts[chain_id])
 
-    return selected
+    summary = {
+        "chains": len(chains_seen),
+        "residues": len(residues_seen),
+        "atoms_total": atoms_total,
+        "atoms_heavy": len(selected),
+        "waters_skipped": waters_skipped,
+        "hydrogens_dropped": hydrogens_removed,
+    }
+
+    return selected, summary
+
+
+def iter_heavy_atoms(structure: Structure) -> Iterable[Tuple[Atom, str, int, str]]:
+    """Iterate over heavy atoms in the first model of the structure."""
+
+    atoms, _ = collect_heavy_atoms_with_summary(structure)
+    return atoms
 
 
 def compute_residue_sasa(
@@ -312,7 +335,7 @@ def compute_residue_sasa(
 
 def compute_residue_osp(
     structure_path: Path, allow_missing: bool
-) -> Dict[Tuple[str, int, str], float]:
+) -> Tuple[Dict[Tuple[str, int, str], float], str]:
     """Compute residue packing density using fibos OSP."""
 
     try:
@@ -321,7 +344,7 @@ def compute_residue_osp(
         msg = "fibos package is required to compute packing density"
         if allow_missing:
             LOGGER.warning("%s; filling OSP with zeros", msg)
-            return {}
+            return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
 
     try:
@@ -330,10 +353,11 @@ def compute_residue_osp(
         msg = f"fibos.osp failed for {structure_path}: {exc}"
         if allow_missing:
             LOGGER.warning("%s; filling OSP with zeros", msg)
-            return {}
+            return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
 
     osp_map: Dict[Tuple[str, int, str], float] = {}
+    osp_source = "fibos"
 
     if isinstance(raw_result, dict):
         for key, value in raw_result.items():
@@ -358,7 +382,7 @@ def compute_residue_osp(
                 LOGGER.warning(
                     "fibos.osp returned a non-dict result but pandas is unavailable; filling OSP with zeros"
                 )
-                return {}
+                return {}, "zero_fallback"
             raise RuntimeError(
                 "fibos.osp returned a non-dict result and pandas is required to interpret it"
             )
@@ -374,7 +398,7 @@ def compute_residue_osp(
                         "fibos.osp returned unsupported result (%s); filling OSP with zeros",
                         type(raw_result),
                     )
-                    return {}
+                    return {}, "zero_fallback"
                 raise RuntimeError(
                     f"fibos.osp returned unsupported result type {type(raw_result)!r}"
                 ) from exc
@@ -408,7 +432,7 @@ def compute_residue_osp(
                     "fibos.osp result missing columns %s; filling OSP with zeros",
                     ", ".join(required_missing),
                 )
-                return {}
+                return {}, "zero_fallback"
             raise RuntimeError(
                 f"fibos.osp result missing required columns: {', '.join(required_missing)}"
             )
@@ -427,10 +451,11 @@ def compute_residue_osp(
             osp_map[(chain_id, resseq, icode)] = osp_value
     if not osp_map and allow_missing:
         LOGGER.warning("fibos.osp returned no data; filling OSP with zeros")
-    elif not osp_map:
+        return {}, "zero_fallback"
+    if not osp_map:
         raise RuntimeError("fibos.osp returned no density data")
 
-    return osp_map
+    return osp_map, osp_source
 
 
 def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
@@ -451,12 +476,12 @@ def build_arrays(
 
     labels = load_labels_json(labels_path)
     structure = parse_structure(structure_path)
-    atoms_info = list(iter_heavy_atoms(structure))
+    atoms_info, summary = collect_heavy_atoms_with_summary(structure)
     if not atoms_info:
         raise RuntimeError("No heavy atoms were found in the structure")
 
     sasa_map = compute_residue_sasa(structure, probe_radius, n_points)
-    osp_map = compute_residue_osp(structure_path, allow_missing_density)
+    osp_map, osp_source = compute_residue_osp(structure_path, allow_missing_density)
 
     n_atoms = len(atoms_info)
     coords = np.empty((n_atoms, 3), dtype=np.float32)
@@ -488,12 +513,39 @@ def build_arrays(
         meta["atom_name"].append(atom.get_fullname().strip())
         meta["element"].append(element)
 
+    provenance = {
+        "osp_source": osp_source,
+        "sasa_probe": float(probe_radius),
+        "sasa_n_points": int(n_points),
+    }
+    summary_payload = {
+        "chains": int(summary["chains"]),
+        "residues": int(summary["residues"]),
+        "atoms_total": int(summary["atoms_total"]),
+        "atoms_heavy": int(summary["atoms_heavy"]),
+        "waters_skipped": int(summary["waters_skipped"]),
+        "hydrogens_dropped": int(summary["hydrogens_dropped"]),
+    }
+
     payload: Dict[str, object] = {
         "coords": coords,
         "features": features,
         "labels": labels_array,
         "meta": meta,
+        "provenance": provenance,
+        "summary": summary_payload,
     }
+
+    LOGGER.info(
+        "atoms=%d (total=%d), residues=%d, chains=%d, osp=%s, probe=%.3f, points=%d",
+        summary_payload["atoms_heavy"],
+        summary_payload["atoms_total"],
+        summary_payload["residues"],
+        summary_payload["chains"],
+        osp_source,
+        provenance["sasa_probe"],
+        provenance["sasa_n_points"],
+    )
 
     return payload
 
@@ -506,6 +558,9 @@ def save_npz(out_path: Path, payload: Dict[str, object]) -> None:
     if not isinstance(meta, dict):  # pragma: no cover - defensive programming
         raise RuntimeError("Payload missing 'meta' dictionary")
 
+    provenance = payload.get("provenance", {}) if isinstance(payload.get("provenance"), dict) else {}
+    summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+
     np.savez(
         out_path,
         coords=payload["coords"],
@@ -516,6 +571,15 @@ def save_npz(out_path: Path, payload: Dict[str, object]) -> None:
         meta_icode=np.array(meta["icode"], dtype=object),
         meta_atom_name=np.array(meta["atom_name"], dtype=object),
         meta_element=np.array(meta["element"], dtype=object),
+        provenance_osp_source=np.array(provenance.get("osp_source", "unknown"), dtype=object),
+        provenance_sasa_probe=float(provenance.get("sasa_probe", 0.0)),
+        provenance_sasa_n_points=int(provenance.get("sasa_n_points", 0)),
+        summary_chains=int(summary.get("chains", 0)),
+        summary_residues=int(summary.get("residues", 0)),
+        summary_atoms_total=int(summary.get("atoms_total", 0)),
+        summary_atoms_heavy=int(summary.get("atoms_heavy", 0)),
+        summary_waters_skipped=int(summary.get("waters_skipped", 0)),
+        summary_hydrogens_dropped=int(summary.get("hydrogens_dropped", 0)),
     )
 
     LOGGER.info("Saved features to %s", out_path)
