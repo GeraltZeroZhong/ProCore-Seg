@@ -149,7 +149,7 @@ class SparseAutoencoder(nn.Module):
         delta = torch.clamp(activated * scale, min=-scale, max=scale)
         offsets = raw_offsets.replace_feature(delta)
 
-        coords = x.C.to(delta.dtype)
+        coords = offsets.C.to(delta.dtype)
         spatial = coords[:, 1:4]
         voxel_center = spatial * self.cfg.quantization_size
         points = voxel_center + delta
