@@ -1,0 +1,540 @@
+"""Fetch mmCIF files for a CATH superfamily from the RCSB PDB.
+
+This script queries the RCSB PDB Search API for all entry identifiers that
+match a provided CATH superfamily identifier, optionally excluding obsolete
+entries. The matching mmCIF files are downloaded in parallel using Biopython
+and stored within the specified output directory. A manifest describing the
+result of each attempted download as well as a plaintext list of PDB entry IDs
+are emitted to facilitate reproducibility.
+
+Usage (CLI arguments override YAML config values):
+
+    python 01_fetch_cull_pdbs.py \
+      --config ./configs/cath_1.10.490.10.yaml \
+      --cath-id 1.10.490.10 \
+      --out-dir ./data/raw_pdbs \
+      --max-workers 8 \
+      --allow-obsolete false \
+      --timeout 20 \
+      --retries 3 \
+      --sleep 0.2 \
+      --log-level INFO
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from time import sleep as blocking_sleep
+from typing import Optional, Sequence, Tuple
+
+import requests
+import yaml
+from Bio.PDB import PDBList
+from requests import Response
+from tqdm import tqdm
+
+LOGGER = logging.getLogger(__name__)
+
+RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
+RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
+DEFAULT_OUT_DIR = Path("./data/raw_pdbs")
+
+
+@dataclass(frozen=True)
+class FetchConfig:
+    """Configuration for fetching mmCIF files for a CATH superfamily."""
+
+    cath_id: str
+    out_dir: Path
+    max_workers: int
+    allow_obsolete: bool
+    timeout: int
+    retries: int
+    sleep: float
+    log_level: str
+
+
+def parse_bool(value: Optional[str]) -> Optional[bool]:
+    """Parse a truthy/falsy string into a boolean value."""
+
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"true", "t", "1", "yes", "y"}:
+        return True
+    if normalized in {"false", "f", "0", "no", "n"}:
+        return False
+    raise ValueError(f"Could not interpret boolean value from '{value}'.")
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse command line arguments."""
+
+    parser = argparse.ArgumentParser(
+        description="Download mmCIF files for a specified CATH superfamily.",
+    )
+    parser.add_argument("--config", type=str, help="Path to YAML configuration file.")
+    parser.add_argument("--cath-id", type=str, help="CATH superfamily identifier.")
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        help=f"Output directory for mmCIF files (default: {DEFAULT_OUT_DIR}).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        help="Number of worker threads to use for mmCIF downloads.",
+    )
+    parser.add_argument(
+        "--allow-obsolete",
+        type=str,
+        help="Allow downloads of obsolete entries (true/false).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        help="HTTP timeout in seconds for RCSB API requests.",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        help="Number of retries for mmCIF downloads.",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        help="Base sleep duration between download attempts in seconds.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        help="Logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
+    return parser.parse_args(argv)
+
+
+def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
+    """Load configuration by merging YAML config and CLI arguments."""
+
+    args = parse_args(argv)
+    config_file_data: dict = {}
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        with config_path.open("r", encoding="utf-8") as handle:
+            config_file_data = yaml.safe_load(handle) or {}
+        if not isinstance(config_file_data, dict):
+            raise ValueError("Config file must contain a mapping of configuration values.")
+
+    def from_config(key: str) -> Optional[object]:
+        value = config_file_data.get(key)
+        return value
+
+    cath_id = args.cath_id or from_config("cath_id")
+    if not cath_id:
+        raise ValueError("CATH ID must be provided via --cath-id or the configuration file.")
+
+    out_dir_str = args.out_dir or from_config("out_dir")
+    out_dir = Path(out_dir_str) if out_dir_str else DEFAULT_OUT_DIR
+
+    max_workers = args.max_workers or from_config("max_workers") or 8
+    allow_obsolete = parse_bool(args.allow_obsolete) if args.allow_obsolete is not None else None
+    if allow_obsolete is None:
+        config_allow_obsolete = from_config("allow_obsolete")
+        if config_allow_obsolete is not None:
+            if isinstance(config_allow_obsolete, bool):
+                allow_obsolete = config_allow_obsolete
+            else:
+                allow_obsolete = parse_bool(str(config_allow_obsolete))
+        else:
+            allow_obsolete = False
+
+    timeout = args.timeout or from_config("timeout") or 20
+    retries = args.retries or from_config("retries") or 3
+    sleep_seconds = args.sleep or from_config("sleep") or 0.2
+    log_level = args.log_level or from_config("log_level") or "INFO"
+
+    max_workers = int(max_workers)
+    if max_workers < 1:
+        raise ValueError("max_workers must be at least 1.")
+
+    timeout = int(timeout)
+    if timeout <= 0:
+        raise ValueError("timeout must be positive.")
+
+    retries = int(retries)
+    if retries < 0:
+        raise ValueError("retries cannot be negative.")
+
+    sleep_seconds = float(sleep_seconds)
+    if sleep_seconds < 0:
+        raise ValueError("sleep must be non-negative.")
+
+    log_level_str = str(log_level).upper()
+    if not hasattr(logging, log_level_str):
+        raise ValueError(f"Unsupported log level: {log_level}")
+
+    return FetchConfig(
+        cath_id=str(cath_id),
+        out_dir=out_dir,
+        max_workers=max_workers,
+        allow_obsolete=bool(allow_obsolete),
+        timeout=timeout,
+        retries=retries,
+        sleep=sleep_seconds,
+        log_level=log_level_str,
+    )
+
+
+def build_rcsb_cath_query(cath_id: str) -> dict:
+    """Construct the JSON payload for querying the RCSB Search API."""
+
+    return {
+        "query": {
+            "type": "group",
+            "logical_operator": "and",
+            "nodes": [
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "rcsb_polymer_entity_annotation.annotation_id",
+                        "operator": "exact_match",
+                        "value": cath_id,
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": "text",
+                    "parameters": {
+                        "attribute": "rcsb_polymer_entity_annotation.annotation_type",
+                        "operator": "exact_match",
+                        "value": "CATH",
+                    },
+                },
+            ],
+        },
+        "return_type": "entry",
+        "request_options": {
+            "return_all_hits": True,
+            "pager": {"start": 0, "rows": 100},
+        },
+    }
+
+
+def _post_json(url: str, payload: dict, timeout: int) -> Response:
+    response = requests.post(url, json=payload, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def _filter_obsolete(entry_ids: Sequence[str], timeout: int) -> list[str]:
+    if not entry_ids:
+        return []
+
+    query = (
+        "query ($ids: [String!]!) {\n"
+        "  entries(entry_ids: $ids) {\n"
+        "    entry_id\n"
+        "    rcsb_accession_info {\n"
+        "      is_obsolete\n"
+        "    }\n"
+        "  }\n"
+        "}"
+    )
+
+    surviving: dict[str, bool] = {entry_id: False for entry_id in entry_ids}
+    chunk_size = 100
+    for start in range(0, len(entry_ids), chunk_size):
+        chunk = entry_ids[start : start + chunk_size]
+        payload = {"query": query, "variables": {"ids": chunk}}
+        response = _post_json(RCSB_GRAPHQL_URL, payload, timeout)
+        data = response.json()
+        if "errors" in data:
+            raise RuntimeError(f"GraphQL error while checking obsolete status: {data['errors']}")
+        entries = data.get("data", {}).get("entries", [])
+        for entry in entries:
+            entry_id = entry.get("entry_id")
+            info = entry.get("rcsb_accession_info") or {}
+            is_obsolete = info.get("is_obsolete", False)
+            if entry_id in surviving:
+                surviving[entry_id] = bool(is_obsolete)
+
+    filtered: list[str] = []
+    for entry_id in entry_ids:
+        if not surviving.get(entry_id, False):
+            filtered.append(entry_id)
+    return filtered
+
+
+def fetch_entry_ids_for_cath(cath_id: str, timeout: int, allow_obsolete: bool) -> list[str]:
+    """Fetch the list of PDB entry IDs annotated with the given CATH superfamily."""
+
+    payload = build_rcsb_cath_query(cath_id)
+    LOGGER.debug("RCSB query payload: %s", json.dumps(payload, indent=2))
+
+    entry_ids: list[str] = []
+    start = 0
+    rows = payload["request_options"]["pager"]["rows"]
+    with requests.Session() as session:
+        while True:
+            payload["request_options"]["pager"]["start"] = start
+            LOGGER.debug("Fetching entries starting at %s", start)
+            response = session.post(RCSB_SEARCH_URL, json=payload, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            result_set = data.get("result_set", [])
+            for result in result_set:
+                identifier = result.get("identifier")
+                if identifier:
+                    entry_ids.append(identifier.upper())
+            total_count = data.get("total_count", len(entry_ids))
+            start += rows
+            if start >= total_count:
+                break
+
+    unique_entry_ids = list(dict.fromkeys(entry_ids))
+    if not unique_entry_ids:
+        raise RuntimeError(f"No PDB entries found for CATH ID {cath_id}.")
+
+    if not allow_obsolete:
+        LOGGER.info("Filtering obsolete entries from %d candidates.", len(unique_entry_ids))
+        filtered = _filter_obsolete(unique_entry_ids, timeout)
+        LOGGER.info("Retained %d non-obsolete entries.", len(filtered))
+        if not filtered:
+            raise RuntimeError(
+                f"No non-obsolete PDB entries found for CATH ID {cath_id}."
+            )
+        return filtered
+
+    return unique_entry_ids
+
+
+def ensure_out_dir(path: Path) -> None:
+    """Ensure the output directory exists and is writable."""
+
+    path.mkdir(parents=True, exist_ok=True)
+    test_file = None
+    try:
+        test_file = NamedTemporaryFile(dir=path, delete=False)
+        test_file.write(b"")
+        test_file.flush()
+    finally:
+        if test_file is not None:
+            test_file.close()
+            os.unlink(test_file.name)
+
+
+def existing_mmcif_path(out_dir: Path, entry_id: str) -> Optional[Path]:
+    """Return the path to an already-downloaded mmCIF file if present."""
+
+    entry_id_lower = entry_id.lower()
+    candidates = [
+        out_dir / f"{entry_id_lower}.cif",
+        out_dir / f"{entry_id_lower}.cif.gz",
+        out_dir / f"pdb{entry_id_lower}.cif",
+        out_dir / f"pdb{entry_id_lower}.cif.gz",
+        out_dir / "mmCIF" / f"{entry_id_lower}.cif",
+        out_dir / "mmCIF" / f"{entry_id_lower}.cif.gz",
+        out_dir / "mmCIF" / f"pdb{entry_id_lower}.cif",
+        out_dir / "mmCIF" / f"pdb{entry_id_lower}.cif.gz",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+
+    # Fallback: search for files matching the entry ID pattern within depth 2
+    for candidate in out_dir.glob(f"**/*{entry_id_lower}*.cif*"):
+        if candidate.is_file() and candidate.stat().st_size > 0:
+            return candidate
+
+    return None
+
+
+def download_mmcif(
+    entry_id: str,
+    out_dir: Path,
+    retries: int,
+    sleep: float,
+) -> Tuple[str, str, Optional[str]]:
+    """Download a single mmCIF file, respecting retries and idempotency."""
+
+    existing = existing_mmcif_path(out_dir, entry_id)
+    if existing is not None:
+        return entry_id, "skipped", str(existing)
+
+    attempt = 0
+    pdb_list = PDBList(obsolete=False)
+    lower_id = entry_id.lower()
+    last_error: Optional[str] = None
+
+    while attempt <= retries:
+        if sleep > 0:
+            blocking_sleep(sleep * (2**attempt if attempt else 1))
+        try:
+            path_str = pdb_list.retrieve_pdb_file(
+                lower_id,
+                pdir=str(out_dir),
+                file_format="mmCif",
+            )
+            if not path_str:
+                raise RuntimeError("Biopython did not return a file path.")
+            path = Path(path_str)
+            if not path.exists():
+                # Biopython sometimes nests files under mmCIF/; look for them.
+                located = existing_mmcif_path(out_dir, entry_id)
+                if located is None:
+                    raise FileNotFoundError(
+                        f"Expected mmCIF file for {entry_id} not found after download."
+                    )
+                path = located
+            elif path.stat().st_size == 0:
+                raise RuntimeError(f"Downloaded file for {entry_id} is empty: {path}")
+            return entry_id, "downloaded", str(path)
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            LOGGER.debug("Download attempt %d for %s failed: %s", attempt + 1, entry_id, last_error)
+            attempt += 1
+            if attempt > retries:
+                break
+    return entry_id, "failed", last_error
+
+
+def write_manifest(out_dir: Path, cath_id: str, results: list[dict]) -> None:
+    """Write a JSON manifest summarizing download outcomes."""
+
+    manifest = {
+        "cath_id": cath_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(results),
+        "entries": results,
+    }
+    target = out_dir / "manifest.json"
+    with NamedTemporaryFile("w", encoding="utf-8", dir=out_dir, delete=False) as handle:
+        json.dump(manifest, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temp_name = handle.name
+    os.replace(temp_name, target)
+
+
+def write_id_list(out_dir: Path, entry_ids: Sequence[str]) -> None:
+    """Write the plaintext ID list to the output directory."""
+
+    sorted_ids = sorted(set(entry_ids))
+    target = out_dir / "pdb_ids.txt"
+    content = "\n".join(sorted_ids) + "\n"
+    with NamedTemporaryFile("w", encoding="utf-8", dir=out_dir, delete=False) as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temp_name = handle.name
+    os.replace(temp_name, target)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point for the CLI script."""
+
+    try:
+        config = load_config(argv)
+    except Exception as exc:  # noqa: BLE001
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        LOGGER.exception("Failed to load configuration: %s", exc)
+        return 1
+
+    logging.basicConfig(
+        level=getattr(logging, config.log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    LOGGER.info("Starting mmCIF fetch for CATH ID %s", config.cath_id)
+
+    try:
+        ensure_out_dir(config.out_dir)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Failed to prepare output directory '%s': %s", config.out_dir, exc)
+        return 1
+
+    try:
+        entry_ids = fetch_entry_ids_for_cath(
+            config.cath_id,
+            timeout=config.timeout,
+            allow_obsolete=config.allow_obsolete,
+        )
+        LOGGER.info("Identified %d entry IDs for CATH ID %s", len(entry_ids), config.cath_id)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Failed to fetch entry IDs: %s", exc)
+        return 1
+
+    results: list[dict] = []
+    try:
+        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+            future_to_id: dict[Future[Tuple[str, str, Optional[str]]], str] = {}
+            for entry_id in entry_ids:
+                future = executor.submit(
+                    download_mmcif,
+                    entry_id,
+                    config.out_dir,
+                    config.retries,
+                    config.sleep,
+                )
+                future_to_id[future] = entry_id
+
+            for future in tqdm(
+                as_completed(future_to_id),
+                total=len(future_to_id),
+                desc="Downloading mmCIF",
+                unit="entry",
+            ):
+                entry_id, status, info = future.result()
+                if status == "failed":
+                    LOGGER.error("Failed to download %s: %s", entry_id, info)
+                    results.append(
+                        {
+                            "entry_id": entry_id,
+                            "status": status,
+                            "path": None,
+                            "error": info,
+                        }
+                    )
+                else:
+                    LOGGER.info("%s %s", status.capitalize(), entry_id)
+                    results.append(
+                        {
+                            "entry_id": entry_id,
+                            "status": status,
+                            "path": info,
+                            "error": None,
+                        }
+                    )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Unexpected error during downloads: %s", exc)
+        return 1
+
+    try:
+        write_manifest(config.out_dir, config.cath_id, results)
+        write_id_list(config.out_dir, [result["entry_id"] for result in results])
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Failed to write output metadata: %s", exc)
+        return 1
+
+    failed = [r for r in results if r["status"] == "failed"]
+    if failed:
+        LOGGER.warning("Completed with %d failed downloads.", len(failed))
+    else:
+        LOGGER.info("Completed successfully with all downloads processed.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
