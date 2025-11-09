@@ -23,6 +23,7 @@ Usage (CLI arguments override YAML config values):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -42,9 +43,15 @@ from tqdm import tqdm
 
 LOGGER = logging.getLogger(__name__)
 
-RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
+RCSB_REQUEST_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 DEFAULT_OUT_DIR = Path("./data/raw_pdbs")
+
+SEARCH_BASES_DEFAULT = [
+    "https://search.rcsb.org/rcsbsearch/v2/query",
+    "https://search-east.rcsb.org/rcsbsearch/v2/query",
+    "https://search-west.rcsb.org/rcsbsearch/v2/query",
+]
 
 
 @dataclass(frozen=True)
@@ -59,6 +66,9 @@ class FetchConfig:
     retries: int
     sleep: float
     log_level: str
+    dry_run: bool
+    self_test: bool
+    search_base: Optional[str]
 
 
 def parse_bool(value: Optional[str]) -> Optional[bool]:
@@ -117,6 +127,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=str,
         help="Logging level (DEBUG, INFO, WARNING, ERROR).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the first RCSB payload without querying remote services.",
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Print sample payloads for diagnostics and exit.",
+    )
+    parser.add_argument(
+        "--search-base",
+        type=str,
+        default="",
+        help=(
+            "Override the RCSB Search API base URL (default uses primary and mirror hosts)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -140,7 +168,10 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
 
     cath_id = args.cath_id or from_config("cath_id")
     if not cath_id:
-        raise ValueError("CATH ID must be provided via --cath-id or the configuration file.")
+        if args.self_test:
+            cath_id = "1.10.490.10"
+        else:
+            raise ValueError("CATH ID must be provided via --cath-id or the configuration file.")
 
     out_dir_str = args.out_dir or from_config("out_dir")
     out_dir = Path(out_dir_str) if out_dir_str else DEFAULT_OUT_DIR
@@ -161,6 +192,30 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
     retries = args.retries or from_config("retries") or 3
     sleep_seconds = args.sleep or from_config("sleep") or 0.2
     log_level = args.log_level or from_config("log_level") or "INFO"
+    dry_run = bool(args.dry_run)
+    if not dry_run:
+        config_dry_run = from_config("dry_run")
+        if config_dry_run is not None:
+            if isinstance(config_dry_run, bool):
+                dry_run = config_dry_run
+            else:
+                dry_run = bool(parse_bool(str(config_dry_run)))
+    self_test = bool(args.self_test)
+    if not self_test:
+        config_self_test = from_config("self_test")
+        if config_self_test is not None:
+            if isinstance(config_self_test, bool):
+                self_test = config_self_test
+            else:
+                self_test = bool(parse_bool(str(config_self_test)))
+
+    search_base = (args.search_base or "").strip()
+    if not search_base:
+        config_search_base = from_config("search_base")
+        if config_search_base is not None:
+            search_base = str(config_search_base).strip()
+    if not search_base:
+        search_base = None
 
     max_workers = int(max_workers)
     if max_workers < 1:
@@ -191,49 +246,177 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
         retries=retries,
         sleep=sleep_seconds,
         log_level=log_level_str,
+        dry_run=dry_run,
+        self_test=self_test,
+        search_base=search_base,
     )
 
 
-def build_rcsb_cath_query(cath_id: str) -> dict:
-    """Construct the JSON payload for querying the RCSB Search API."""
+def build_rcsb_cath_payloads(
+    cath_id: str, allow_obsolete: bool, attr_root: str, service: str = "text"
+) -> list[dict]:
+    """Construct candidate payloads for the RCSB Search API."""
 
-    return {
-        "query": {
-            "type": "group",
-            "logical_operator": "and",
-            "nodes": [
-                {
-                    "type": "terminal",
-                    "service": "text",
-                    "parameters": {
-                        "attribute": "rcsb_polymer_entity_annotation.annotation_id",
-                        "operator": "exact_match",
-                        "value": cath_id,
-                    },
-                },
-                {
-                    "type": "terminal",
-                    "service": "text",
-                    "parameters": {
-                        "attribute": "rcsb_polymer_entity_annotation.annotation_type",
-                        "operator": "exact_match",
-                        "value": "CATH",
-                    },
-                },
-            ],
-        },
-        "return_type": "entry",
-        "request_options": {
-            "return_all_hits": True,
-            "pager": {"start": 0, "rows": 100},
+    base_nodes: list[dict] = [
+        {
+            "type": "terminal",
+            "service": service,
+            "parameters": {
+                "attribute": f"{attr_root}.type",
+                "operator": "exact_match",
+                "value": "CATH",
+            },
+        }
+    ]
+
+    lineage_contains = {
+        "type": "terminal",
+        "service": service,
+        "parameters": {
+            "attribute": f"{attr_root}.annotation_lineage.id",
+            "operator": "contains_phrase",
+            "value": cath_id,
         },
     }
 
+    ann_exact_prefixed = {
+        "type": "terminal",
+        "service": service,
+        "parameters": {
+            "attribute": f"{attr_root}.annotation_id",
+            "operator": "exact_match",
+            "value": f"CATH:{cath_id}",
+        },
+    }
+
+    ann_exact_bare = {
+        "type": "terminal",
+        "service": service,
+        "parameters": {
+            "attribute": f"{attr_root}.annotation_id",
+            "operator": "exact_match",
+            "value": cath_id,
+        },
+    }
+
+    def _payload(nodes: list[dict]) -> dict:
+        query_nodes = list(base_nodes) + list(nodes)
+        if not allow_obsolete:
+            query_nodes.append(
+                {
+                    "type": "terminal",
+                    "service": service,
+                    "parameters": {
+                        "attribute": "rcsb_accession_info.is_obsolete",
+                        "operator": "exact_match",
+                        "value": False,
+                    },
+                }
+            )
+        return {
+            "query": {
+                "type": "group",
+                "logical_operator": "and",
+                "nodes": query_nodes,
+            },
+            "return_type": "entry",
+            "request_options": {
+                "paginate": {"start": 0, "rows": 10000},
+                "results_content_type": ["experimental"],
+            },
+        }
+
+    return [
+        _payload([lineage_contains]),
+        _payload([ann_exact_prefixed]),
+        _payload([ann_exact_bare]),
+    ]
+
 
 def _post_json(url: str, payload: dict, timeout: int) -> Response:
-    response = requests.post(url, json=payload, timeout=timeout)
-    response.raise_for_status()
+    response = requests.post(url, headers=RCSB_REQUEST_HEADERS, json=payload, timeout=timeout)
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:  # noqa: BLE001
+        snippet = (response.text or "")[:2000]
+        LOGGER.error(
+            "HTTP error %s for %s with body snippet: %s",
+            response.status_code,
+            url,
+            snippet,
+        )
+        raise exc
     return response
+
+
+def _post_with_diagnostics(
+    session: requests.Session, url: str, payload: dict, timeout: int
+) -> dict:
+    """POST JSON payload to the provided URL with detailed diagnostics."""
+
+    logger = logging.getLogger(__name__)
+    logger.debug("POST %s payload:\n%s", url, json.dumps(payload, indent=2, sort_keys=True))
+    response = session.post(url, headers=RCSB_REQUEST_HEADERS, json=payload, timeout=timeout)
+    if response.status_code >= 400:
+        snippet = (response.text or "")[:2000]
+        raise requests.HTTPError(
+            f"HTTP {response.status_code} at {url}; body[:2000]= {snippet}", response=response
+        )
+    try:
+        return response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Non-JSON response from {url}: {exc}") from exc
+
+
+def _search_with_paging(
+    session: requests.Session, url: str, payload: dict, timeout: int
+) -> list[str]:
+    """Submit the payload and collect all entry identifiers with pagination."""
+
+    working_payload = json.loads(json.dumps(payload))
+    request_options = working_payload.setdefault("request_options", {})
+    paginate = request_options.setdefault("paginate", {"start": 0, "rows": 10000})
+    start = int(paginate.get("start", 0))
+    rows = int(paginate.get("rows", 10000))
+
+    results: list[str] = []
+    while True:
+        paginate["start"] = start
+        data = _post_with_diagnostics(session, url, working_payload, timeout)
+        result_set = data.get("result_set", []) or []
+        for item in result_set:
+            identifier = item.get("identifier")
+            if identifier:
+                results.append(identifier)
+
+        total_count = data.get("total_count")
+        if not result_set:
+            break
+        start += rows
+        if isinstance(total_count, int) and start >= total_count:
+            break
+    return results
+
+
+def _retry_as_polymer_entity(
+    session: requests.Session, url: str, payload: dict, timeout: int
+) -> list[str]:
+    """Retry the search as a polymer entity query and map identifiers to entries."""
+
+    polymer_payload = copy.deepcopy(payload)
+    polymer_payload["return_type"] = "polymer_entity"
+    identifiers = _search_with_paging(session, url, polymer_payload, timeout)
+    entries: list[str] = []
+    for identifier in identifiers:
+        if not isinstance(identifier, str):
+            continue
+        cleaned = identifier.strip()
+        if "_" not in cleaned:
+            continue
+        entry_part = cleaned.split("_", 1)[0]
+        if len(entry_part) >= 4:
+            entries.append(entry_part[:4].upper())
+    return entries
 
 
 def _filter_obsolete(entry_ids: Sequence[str], timeout: int) -> list[str]:
@@ -275,47 +458,77 @@ def _filter_obsolete(entry_ids: Sequence[str], timeout: int) -> list[str]:
     return filtered
 
 
-def fetch_entry_ids_for_cath(cath_id: str, timeout: int, allow_obsolete: bool) -> list[str]:
+def fetch_entry_ids_for_cath(
+    cath_id: str,
+    timeout: int,
+    allow_obsolete: bool,
+    search_base: Optional[str] = None,
+) -> list[str]:
     """Fetch the list of PDB entry IDs annotated with the given CATH superfamily."""
 
-    payload = build_rcsb_cath_query(cath_id)
-    LOGGER.debug("RCSB query payload: %s", json.dumps(payload, indent=2))
+    session = requests.Session()
+    bases = [search_base] if search_base else SEARCH_BASES_DEFAULT
+    bases = [base for base in bases if base]
+    if not bases:
+        bases = SEARCH_BASES_DEFAULT
 
-    entry_ids: list[str] = []
-    start = 0
-    rows = payload["request_options"]["pager"]["rows"]
-    with requests.Session() as session:
-        while True:
-            payload["request_options"]["pager"]["start"] = start
-            LOGGER.debug("Fetching entries starting at %s", start)
-            response = session.post(RCSB_SEARCH_URL, json=payload, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
-            result_set = data.get("result_set", [])
-            for result in result_set:
-                identifier = result.get("identifier")
-                if identifier:
-                    entry_ids.append(identifier.upper())
-            total_count = data.get("total_count", len(entry_ids))
-            start += rows
-            if start >= total_count:
-                break
+    errors: list[str] = []
 
-    unique_entry_ids = list(dict.fromkeys(entry_ids))
-    if not unique_entry_ids:
-        raise RuntimeError(f"No PDB entries found for CATH ID {cath_id}.")
+    def _normalize(ids: Sequence[str]) -> set[str]:
+        normalized: set[str] = set()
+        for identifier in ids:
+            if not isinstance(identifier, str):
+                continue
+            cleaned = identifier.strip()
+            if len(cleaned) >= 4:
+                normalized.add(cleaned[:4].upper())
+        return normalized
 
-    if not allow_obsolete:
-        LOGGER.info("Filtering obsolete entries from %d candidates.", len(unique_entry_ids))
-        filtered = _filter_obsolete(unique_entry_ids, timeout)
-        LOGGER.info("Retained %d non-obsolete entries.", len(filtered))
-        if not filtered:
-            raise RuntimeError(
-                f"No non-obsolete PDB entries found for CATH ID {cath_id}."
-            )
-        return filtered
+    try:
+        for attr_root in (
+            "rcsb_polymer_instance_annotation",
+            "rcsb_polymer_entity_annotation",
+        ):
+            payloads = build_rcsb_cath_payloads(cath_id, allow_obsolete, attr_root)
+            for base in bases:
+                for payload in payloads:
+                    try:
+                        identifiers = _search_with_paging(session, base, payload, timeout)
+                        normalized = _normalize(identifiers)
+                        if not normalized:
+                            fallback_ids = _retry_as_polymer_entity(
+                                session, base, payload, timeout
+                            )
+                            normalized = _normalize(fallback_ids)
+                        if normalized:
+                            unique_ids = sorted(normalized)
+                            LOGGER.info(
+                                "Fetched %d entries for CATH %s via %s (%s).",
+                                len(unique_ids),
+                                cath_id,
+                                base,
+                                attr_root,
+                            )
+                            return unique_ids
+                    except requests.HTTPError as exc:  # noqa: BLE001
+                        compact_payload = json.dumps(payload, separators=(",", ":"))
+                        error_msg = f"{base} | {attr_root} | {exc} | PAYLOAD={compact_payload}"
+                        errors.append(error_msg)
+                        LOGGER.warning("Fetch error on %s / %s: %s", base, attr_root, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{base} | {attr_root} | {exc}")
+                        LOGGER.warning("Fetch exception on %s / %s: %s", base, attr_root, exc)
+    finally:
+        session.close()
 
-    return unique_entry_ids
+    if errors:
+        raise RuntimeError(
+            "Failed to fetch entry IDs for CATH ID "
+            f"{cath_id}. Attempts={len(errors)}. Last error: {errors[-1]}"
+        )
+    raise RuntimeError(
+        f"No entries found for CATH ID {cath_id}. Try without obsolete filter or verify CATH ID."
+    )
 
 
 def ensure_out_dir(path: Path) -> None:
@@ -441,6 +654,34 @@ def write_id_list(out_dir: Path, entry_ids: Sequence[str]) -> None:
     os.replace(temp_name, target)
 
 
+def _run_self_test() -> None:
+    """Emit diagnostic payloads and ensure boolean formatting is correct."""
+
+    test_cath_id = "1.10.490.10"
+    print(f"Self-test payloads for {test_cath_id} (allow_obsolete=False):")
+    boolean_nodes = []
+    for root in (
+        "rcsb_polymer_instance_annotation",
+        "rcsb_polymer_entity_annotation",
+    ):
+        print(f"\nAttribute root: {root}")
+        queries = build_rcsb_cath_payloads(test_cath_id, allow_obsolete=False, attr_root=root)
+        for index, payload in enumerate(queries, start=1):
+            print(f"\nPayload {index}:")
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            nodes = payload.get("query", {}).get("nodes", [])
+            for node in nodes:
+                params = node.get("parameters", {})
+                if params.get("attribute") == "rcsb_accession_info.is_obsolete":
+                    boolean_nodes.append(params.get("value"))
+    if not boolean_nodes:
+        raise AssertionError("Self-test expected obsolete filter nodes to be present.")
+    for value in boolean_nodes:
+        if value is not False:
+            raise AssertionError("Obsolete filter value must be boolean False, not a string.")
+    print("\nSelf-test completed successfully.")
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point for the CLI script."""
 
@@ -456,7 +697,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if config.self_test:
+        _run_self_test()
+        return 0
+
     LOGGER.info("Starting mmCIF fetch for CATH ID %s", config.cath_id)
+
+    if config.dry_run:
+        for root in (
+            "rcsb_polymer_instance_annotation",
+            "rcsb_polymer_entity_annotation",
+        ):
+            payloads = build_rcsb_cath_payloads(
+                config.cath_id, config.allow_obsolete, attr_root=root
+            )
+            if payloads:
+                LOGGER.info(
+                    "Dry run payload for %s:\n%s",
+                    root,
+                    json.dumps(payloads[0], indent=2, sort_keys=True),
+                )
+                print(json.dumps(payloads[0], indent=2, sort_keys=True))
+            else:
+                LOGGER.warning("Dry run generated no payloads for %s.", root)
+        return 0
 
     try:
         ensure_out_dir(config.out_dir)
@@ -469,6 +733,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             config.cath_id,
             timeout=config.timeout,
             allow_obsolete=config.allow_obsolete,
+            search_base=config.search_base,
         )
         LOGGER.info("Identified %d entry IDs for CATH ID %s", len(entry_ids), config.cath_id)
     except Exception as exc:  # noqa: BLE001
