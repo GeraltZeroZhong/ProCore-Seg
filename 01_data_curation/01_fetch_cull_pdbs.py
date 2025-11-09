@@ -23,7 +23,7 @@ Usage (CLI arguments override YAML config values):
 from __future__ import annotations
 
 import argparse
-import copy
+import itertools
 import json
 import logging
 import os
@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import sleep as blocking_sleep
-from typing import Optional, Sequence, Tuple
+from typing import Iterator, Optional, Sequence, Tuple
 
 import requests
 import yaml
@@ -42,8 +42,8 @@ from tqdm import tqdm
 
 LOGGER = logging.getLogger(__name__)
 
-RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
 RCSB_REQUEST_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
+HOLDINGS_BASE = "https://data.rcsb.org/rest/v1/holdings"
 DEFAULT_OUT_DIR = Path("./data/raw_pdbs")
 
 SEARCH_BASES_DEFAULT = [
@@ -251,35 +251,33 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
     )
 
 
-def build_rcsb_cath_queries(cath_id: str, service: str = "text") -> list[dict]:
-    """Construct Search API payloads targeting CATH annotations."""
+def build_cath_search_payload(cath_id: str, service: str = "text") -> dict:
+    """Primary Search API payload for a CATH superfamily."""
 
-    nodes = [
-        {
-            "type": "terminal",
-            "service": service,
-            "parameters": {
-                "attribute": "rcsb_polymer_instance_annotation.type",
-                "operator": "exact_match",
-                "value": "CATH",
-            },
-        },
-        {
-            "type": "terminal",
-            "service": service,
-            "parameters": {
-                "attribute": "rcsb_polymer_instance_annotation.annotation_lineage.id",
-                "operator": "contains_phrase",
-                "value": cath_id,
-            },
-        },
-    ]
-
-    payload = {
+    return {
         "query": {
             "type": "group",
             "logical_operator": "and",
-            "nodes": nodes,
+            "nodes": [
+                {
+                    "type": "terminal",
+                    "service": service,
+                    "parameters": {
+                        "attribute": "rcsb_polymer_instance_annotation.type",
+                        "operator": "exact_match",
+                        "value": "CATH",
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": service,
+                    "parameters": {
+                        "attribute": "rcsb_polymer_instance_annotation.annotation_lineage.id",
+                        "operator": "exact_match",
+                        "value": cath_id,
+                    },
+                },
+            ],
         },
         "return_type": "entry",
         "request_options": {
@@ -288,7 +286,55 @@ def build_rcsb_cath_queries(cath_id: str, service: str = "text") -> list[dict]:
         },
     }
 
-    return [payload]
+
+def build_cath_search_backups(cath_id: str, service: str = "text") -> list[dict]:
+    """Fallback payloads that target annotation IDs directly."""
+
+    def payload(attribute: str, value: str) -> dict:
+        return {
+            "query": {
+                "type": "group",
+                "logical_operator": "and",
+                "nodes": [
+                    {
+                        "type": "terminal",
+                        "service": service,
+                        "parameters": {
+                            "attribute": "rcsb_polymer_instance_annotation.type",
+                            "operator": "exact_match",
+                            "value": "CATH",
+                        },
+                    },
+                    {
+                        "type": "terminal",
+                        "service": service,
+                        "parameters": {
+                            "attribute": attribute,
+                            "operator": "exact_match",
+                            "value": value,
+                        },
+                    },
+                ],
+            },
+            "return_type": "entry",
+            "request_options": {
+                "paginate": {"start": 0, "rows": 10000},
+                "results_content_type": ["experimental"],
+            },
+        }
+
+    return [
+        payload("rcsb_polymer_instance_annotation.annotation_id", f"CATH:{cath_id}"),
+        payload("rcsb_polymer_instance_annotation.annotation_id", cath_id),
+    ]
+
+
+def build_rcsb_cath_queries(cath_id: str, service: str = "text") -> list[dict]:
+    """Construct Search API payloads targeting CATH annotations."""
+
+    payloads = [build_cath_search_payload(cath_id, service=service)]
+    payloads.extend(build_cath_search_backups(cath_id, service=service))
+    return payloads
 
 
 def _search_with_paging(
@@ -340,51 +386,123 @@ def _search_with_paging(
     ]
 
 
-def filter_nonobsolete_entries(
-    entry_ids: Sequence[str], timeout: int = 30, session: Optional[requests.Session] = None
-) -> list[str]:
-    """Filter out obsolete entries using the RCSB Data API."""
+def _chunked(seq: Sequence[str], n: int) -> Iterator[list[str]]:
+    """Yield successive n-sized chunks from the sequence."""
+
+    it = iter(seq)
+    while True:
+        block = list(itertools.islice(it, n))
+        if not block:
+            return
+        yield block
+
+
+def fetch_holdings_status_map(
+    entry_ids: Sequence[str],
+    timeout: int = 30,
+    session: Optional[requests.Session] = None,
+    use_removed_cache: bool = True,
+    chunk_size: int = 300,
+) -> dict[str, str]:
+    """Return a mapping from entry ID to holdings status (CURRENT/OBSOLETE/etc.)."""
 
     if not entry_ids:
-        return []
+        return {}
 
-    chunk_size = 300
+    uppercase_ids = [entry.upper() for entry in entry_ids if entry]
+    if not uppercase_ids:
+        return {}
+
     own_session = session is None
     sess = session or requests.Session()
-    original = {entry_id.upper() for entry_id in entry_ids}
-    kept: set[str] = set(original)
+    logger = logging.getLogger(__name__)
+    statuses: dict[str, str] = {}
+
     try:
-        for start in range(0, len(entry_ids), chunk_size):
-            chunk = [entry_id.upper() for entry_id in entry_ids[start : start + chunk_size]]
-            payload = {
-                "query": (
-                    "query($ids:[String!]!){\n"
-                    "  entries(entry_ids:$ids){\n"
-                    "    rcsb_id\n"
-                    "    rcsb_accession_info{\n"
-                    "      is_obsolete\n"
-                    "    }\n"
-                    "  }\n"
-                    "}"
-                ),
-                "variables": {"ids": chunk},
-            }
-            response = sess.post(RCSB_GRAPHQL_URL, json=payload, timeout=timeout)
-            response.raise_for_status()
-            data = response.json()
-            errors = data.get("errors")
-            if errors:
-                raise RuntimeError(f"GraphQL returned errors: {errors}")
-            for entry in data.get("data", {}).get("entries", []) or []:
-                entry_id = entry.get("rcsb_id")
-                info = entry.get("rcsb_accession_info") or {}
-                if entry_id and info.get("is_obsolete", False):
-                    kept.discard(entry_id.upper())
+        try:
+            for chunk in _chunked(uppercase_ids, chunk_size):
+                params = {"ids": ",".join(chunk)}
+                response = sess.get(
+                    f"{HOLDINGS_BASE}/status", params=params, timeout=timeout
+                )
+                response.raise_for_status()
+                for record in response.json() or []:
+                    pdb_id = str(record.get("pdb_id", "")).upper()
+                    status = str(record.get("status", "")).upper() or "UNKNOWN"
+                    if pdb_id:
+                        statuses[pdb_id] = status
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to retrieve holdings status; falling back to removed cache only: %s",
+                exc,
+            )
+            statuses = {}
+
+        missing = {entry for entry in uppercase_ids if entry not in statuses}
+        if missing and use_removed_cache:
+            try:
+                response = sess.get(
+                    f"{HOLDINGS_BASE}/removed/entry_ids", timeout=timeout
+                )
+                response.raise_for_status()
+                removed = {str(item).upper() for item in (response.json() or [])}
+                for entry in missing:
+                    if entry in removed:
+                        statuses.setdefault(entry, "OBSOLETE")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Removed list fetch failed while classifying entries: %s", exc
+                )
+
+        for entry in uppercase_ids:
+            statuses.setdefault(entry, "UNKNOWN")
+        return statuses
     finally:
         if own_session:
             sess.close()
 
-    return sorted(original & kept)
+
+def filter_nonobsolete_entries_rest(
+    entry_ids: list[str],
+    timeout: int = 30,
+    session: Optional[requests.Session] = None,
+    use_removed_cache: bool = True,
+    chunk_size: int = 300,
+) -> list[str]:
+    """Filter out obsolete entries using the RCSB Holdings REST API."""
+
+    if not entry_ids:
+        return []
+
+    own_session = session is None
+    sess = session or requests.Session()
+
+    try:
+        statuses = fetch_holdings_status_map(
+            entry_ids,
+            timeout=timeout,
+            session=sess,
+            use_removed_cache=use_removed_cache,
+            chunk_size=chunk_size,
+        )
+    finally:
+        if own_session:
+            sess.close()
+
+    kept = sorted(
+        {
+            entry.upper()
+            for entry in entry_ids
+            if statuses.get(entry.upper(), "UNKNOWN") != "OBSOLETE"
+        }
+    )
+
+    if not kept:
+        raise RuntimeError(
+            "All candidate entries are obsolete or holdings/status returned empty."
+        )
+
+    return kept
 
 
 def fetch_entry_ids_for_cath(
@@ -433,7 +551,11 @@ def fetch_entry_ids_for_cath(
         if allow_obsolete:
             return unique_ids
 
-        filtered_ids = filter_nonobsolete_entries(unique_ids, timeout=timeout, session=session)
+        filtered_ids = filter_nonobsolete_entries_rest(
+            unique_ids,
+            timeout=timeout,
+            session=session,
+        )
         if not filtered_ids:
             raise RuntimeError(
                 "All candidate entries are obsolete or failed Data API filtering for "
@@ -491,52 +613,136 @@ def existing_mmcif_path(out_dir: Path, entry_id: str) -> Optional[Path]:
     return None
 
 
+def http_fallback_mmcif(
+    entry_id: str,
+    out_dir: Path,
+    overwrite_existing: bool,
+    timeout: int,
+) -> Optional[Path]:
+    """Download mmCIF via the RCSB file service as a fallback path."""
+
+    entry_upper = entry_id.upper()
+    entry_lower = entry_id.lower()
+    urls = [
+        f"https://files.rcsb.org/download/{entry_upper}.cif.gz",
+        f"https://files.rcsb.org/download/{entry_upper}.cif",
+    ]
+
+    for url in urls:
+        try:
+            with requests.get(url, stream=True, timeout=timeout) as response:
+                if response.status_code != 200:
+                    LOGGER.debug(
+                        "HTTP fallback for %s returned %s at %s",
+                        entry_upper,
+                        response.status_code,
+                        url,
+                    )
+                    continue
+
+                suffix = ".cif.gz" if url.endswith(".gz") else ".cif"
+                destination = out_dir / f"{entry_lower}{suffix}"
+                if destination.exists() and not overwrite_existing:
+                    return destination
+
+                with NamedTemporaryFile(dir=out_dir, delete=False) as handle:
+                    for chunk in response.iter_content(1 << 16):
+                        if chunk:
+                            handle.write(chunk)
+                    handle.flush()
+                    temp_path = Path(handle.name)
+
+                os.replace(temp_path, destination)
+                return destination
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug(
+                "HTTP fallback attempt for %s at %s failed: %s", entry_upper, url, exc
+            )
+
+    return None
+
+
 def download_mmcif(
     entry_id: str,
     out_dir: Path,
     retries: int,
     sleep: float,
+    is_obsolete: bool,
+    timeout: int,
+    overwrite_existing: bool = False,
 ) -> Tuple[str, str, Optional[str]]:
-    """Download a single mmCIF file, respecting retries and idempotency."""
+    """Download a single mmCIF file with retry logic and HTTP fallback."""
 
-    existing = existing_mmcif_path(out_dir, entry_id)
-    if existing is not None:
-        return entry_id, "skipped", str(existing)
+    if not overwrite_existing:
+        existing = existing_mmcif_path(out_dir, entry_id)
+        if existing is not None:
+            return entry_id, "skipped", str(existing)
 
     attempt = 0
-    pdb_list = PDBList(obsolete=False)
-    lower_id = entry_id.lower()
     last_error: Optional[str] = None
 
     while attempt <= retries:
-        if sleep > 0:
-            blocking_sleep(sleep * (2**attempt if attempt else 1))
+        if attempt > 0 and sleep > 0:
+            blocking_sleep(sleep * (2 ** (attempt - 1)))
+
         try:
+            pdb_list = PDBList()
+            entry_code = entry_id.lower()
             path_str = pdb_list.retrieve_pdb_file(
-                lower_id,
-                pdir=str(out_dir),
+                pdb_code=entry_code,
                 file_format="mmCif",
+                pdir=str(out_dir),
+                overwrite=overwrite_existing,
+                obsolete=is_obsolete,
             )
             if not path_str:
                 raise RuntimeError("Biopython did not return a file path.")
-            path = Path(path_str)
-            if not path.exists():
-                # Biopython sometimes nests files under mmCIF/; look for them.
-                located = existing_mmcif_path(out_dir, entry_id)
-                if located is None:
-                    raise FileNotFoundError(
-                        f"Expected mmCIF file for {entry_id} not found after download."
-                    )
-                path = located
-            elif path.stat().st_size == 0:
-                raise RuntimeError(f"Downloaded file for {entry_id} is empty: {path}")
-            return entry_id, "downloaded", str(path)
+
+            located = existing_mmcif_path(out_dir, entry_id)
+            candidate_path = Path(path_str)
+            if located is not None:
+                candidate_path = located
+            if not candidate_path.exists() or candidate_path.stat().st_size == 0:
+                raise FileNotFoundError(
+                    f"Expected mmCIF file for {entry_id} not found after download."
+                )
+
+            return entry_id, "downloaded", str(candidate_path)
         except Exception as exc:  # noqa: BLE001
             last_error = str(exc)
-            LOGGER.debug("Download attempt %d for %s failed: %s", attempt + 1, entry_id, last_error)
-            attempt += 1
-            if attempt > retries:
-                break
+            LOGGER.warning(
+                "Biopython download attempt %d for %s failed: %s",
+                attempt + 1,
+                entry_id,
+                last_error,
+            )
+            fallback_path = http_fallback_mmcif(
+                entry_id,
+                out_dir,
+                overwrite_existing=overwrite_existing,
+                timeout=timeout,
+            )
+            if fallback_path is not None:
+                if fallback_path.stat().st_size == 0:
+                    fallback_path.unlink(missing_ok=True)  # type: ignore[attr-defined]
+                    LOGGER.warning(
+                        "HTTP fallback produced empty file for %s; continuing retries.",
+                        entry_id,
+                    )
+                else:
+                    LOGGER.info(
+                        "Retrieved %s via HTTP fallback (%s)", entry_id, fallback_path.name
+                    )
+                    return entry_id, "downloaded", str(fallback_path)
+
+        attempt += 1
+
+    if is_obsolete:
+        LOGGER.warning(
+            "Obsolete entry %s could not be retrieved; coordinates may be unavailable on all mirrors.",
+            entry_id,
+        )
+
     return entry_id, "failed", last_error
 
 
@@ -642,6 +848,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOGGER.exception("Failed to fetch entry IDs: %s", exc)
         return 1
 
+    obsolete_flags: dict[str, bool] = {entry_id: False for entry_id in entry_ids}
+    if config.allow_obsolete and entry_ids:
+        try:
+            with requests.Session() as status_session:
+                status_map = fetch_holdings_status_map(
+                    entry_ids,
+                    timeout=config.timeout,
+                    session=status_session,
+                )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to classify entry statuses via holdings API: %s", exc)
+            return 1
+
+        unknown_entries: list[str] = []
+        for entry_id in entry_ids:
+            status = status_map.get(entry_id.upper(), "UNKNOWN")
+            if status == "UNKNOWN":
+                unknown_entries.append(entry_id)
+            obsolete_flags[entry_id] = status == "OBSOLETE"
+
+        current_count = sum(1 for flag in obsolete_flags.values() if not flag)
+        obsolete_count = sum(1 for flag in obsolete_flags.values() if flag)
+        LOGGER.info(
+            "Classified entry statuses: current=%d, obsolete=%d",
+            current_count,
+            obsolete_count,
+        )
+        if unknown_entries:
+            preview = ", ".join(sorted(unknown_entries)[:5])
+            if len(unknown_entries) > 5:
+                preview = f"{preview}, …"
+            LOGGER.warning(
+                "Holdings status unavailable for %d entries; treating as current: %s",
+                len(unknown_entries),
+                preview,
+            )
+    else:
+        LOGGER.info(
+            "Classified entry statuses: current=%d, obsolete=%d (obsolete downloads disabled)",
+            len(entry_ids),
+            0,
+        )
+
     results: list[dict] = []
     try:
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
@@ -653,6 +902,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     config.out_dir,
                     config.retries,
                     config.sleep,
+                    obsolete_flags.get(entry_id, False),
+                    config.timeout,
                 )
                 future_to_id[future] = entry_id
 
