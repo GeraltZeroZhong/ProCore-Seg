@@ -23,6 +23,7 @@ Usage (CLI arguments override YAML config values):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
