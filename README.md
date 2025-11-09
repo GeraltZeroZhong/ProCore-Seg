@@ -53,7 +53,7 @@ python -m pip install -r procore_seg/requirements.txt
 pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch torchvision
 
 # Install MinkowskiEngine (match the CUDA version used above)
-pip install -U "git+https://github.com/NVIDIA/MinkowskiEngine@v0.6.1"
+pip install -U "git+https://github.com/NVIDIA/MinkowskiEngine"
 
 # Optional but recommended extras for evaluation/visualisation
 pip install matplotlib pandas tabulate fibos
