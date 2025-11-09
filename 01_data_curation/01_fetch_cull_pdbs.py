@@ -251,35 +251,33 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
     )
 
 
-def build_rcsb_cath_queries(cath_id: str, service: str = "text") -> list[dict]:
-    """Construct Search API payloads targeting CATH annotations."""
+def build_cath_search_payload(cath_id: str, service: str = "text") -> dict:
+    """Primary Search API payload for a CATH superfamily."""
 
-    nodes = [
-        {
-            "type": "terminal",
-            "service": service,
-            "parameters": {
-                "attribute": "rcsb_polymer_instance_annotation.type",
-                "operator": "exact_match",
-                "value": "CATH",
-            },
-        },
-        {
-            "type": "terminal",
-            "service": service,
-            "parameters": {
-                "attribute": "rcsb_polymer_instance_annotation.annotation_lineage.id",
-                "operator": "contains_phrase",
-                "value": cath_id,
-            },
-        },
-    ]
-
-    payload = {
+    return {
         "query": {
             "type": "group",
             "logical_operator": "and",
-            "nodes": nodes,
+            "nodes": [
+                {
+                    "type": "terminal",
+                    "service": service,
+                    "parameters": {
+                        "attribute": "rcsb_polymer_instance_annotation.type",
+                        "operator": "exact_match",
+                        "value": "CATH",
+                    },
+                },
+                {
+                    "type": "terminal",
+                    "service": service,
+                    "parameters": {
+                        "attribute": "rcsb_polymer_instance_annotation.annotation_lineage.id",
+                        "operator": "exact_match",
+                        "value": cath_id,
+                    },
+                },
+            ],
         },
         "return_type": "entry",
         "request_options": {
@@ -288,7 +286,55 @@ def build_rcsb_cath_queries(cath_id: str, service: str = "text") -> list[dict]:
         },
     }
 
-    return [payload]
+
+def build_cath_search_backups(cath_id: str, service: str = "text") -> list[dict]:
+    """Fallback payloads that target annotation IDs directly."""
+
+    def payload(attribute: str, value: str) -> dict:
+        return {
+            "query": {
+                "type": "group",
+                "logical_operator": "and",
+                "nodes": [
+                    {
+                        "type": "terminal",
+                        "service": service,
+                        "parameters": {
+                            "attribute": "rcsb_polymer_instance_annotation.type",
+                            "operator": "exact_match",
+                            "value": "CATH",
+                        },
+                    },
+                    {
+                        "type": "terminal",
+                        "service": service,
+                        "parameters": {
+                            "attribute": attribute,
+                            "operator": "exact_match",
+                            "value": value,
+                        },
+                    },
+                ],
+            },
+            "return_type": "entry",
+            "request_options": {
+                "paginate": {"start": 0, "rows": 10000},
+                "results_content_type": ["experimental"],
+            },
+        }
+
+    return [
+        payload("rcsb_polymer_instance_annotation.annotation_id", f"CATH:{cath_id}"),
+        payload("rcsb_polymer_instance_annotation.annotation_id", cath_id),
+    ]
+
+
+def build_rcsb_cath_queries(cath_id: str, service: str = "text") -> list[dict]:
+    """Construct Search API payloads targeting CATH annotations."""
+
+    payloads = [build_cath_search_payload(cath_id, service=service)]
+    payloads.extend(build_cath_search_backups(cath_id, service=service))
+    return payloads
 
 
 def _search_with_paging(
