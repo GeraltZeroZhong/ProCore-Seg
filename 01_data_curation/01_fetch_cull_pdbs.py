@@ -23,7 +23,7 @@ Usage (CLI arguments override YAML config values):
 from __future__ import annotations
 
 import argparse
-import copy
+import itertools
 import json
 import logging
 import os
@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import sleep as blocking_sleep
-from typing import Optional, Sequence, Tuple
+from typing import Iterator, Optional, Sequence, Tuple
 
 import requests
 import yaml
@@ -42,8 +42,8 @@ from tqdm import tqdm
 
 LOGGER = logging.getLogger(__name__)
 
-RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
 RCSB_REQUEST_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
+HOLDINGS_BASE = "https://data.rcsb.org/rest/v1/holdings"
 DEFAULT_OUT_DIR = Path("./data/raw_pdbs")
 
 SEARCH_BASES_DEFAULT = [
@@ -386,51 +386,71 @@ def _search_with_paging(
     ]
 
 
-def filter_nonobsolete_entries(
-    entry_ids: Sequence[str], timeout: int = 30, session: Optional[requests.Session] = None
+def _chunked(seq: Sequence[str], n: int) -> Iterator[list[str]]:
+    """Yield successive n-sized chunks from the sequence."""
+
+    it = iter(seq)
+    while True:
+        block = list(itertools.islice(it, n))
+        if not block:
+            return
+        yield block
+
+
+def filter_nonobsolete_entries_rest(
+    entry_ids: list[str],
+    timeout: int = 30,
+    session: Optional[requests.Session] = None,
+    use_removed_cache: bool = True,
+    chunk_size: int = 300,
 ) -> list[str]:
-    """Filter out obsolete entries using the RCSB Data API."""
+    """Filter out obsolete entries using the RCSB Holdings REST API."""
 
     if not entry_ids:
         return []
 
-    chunk_size = 300
     own_session = session is None
     sess = session or requests.Session()
-    original = {entry_id.upper() for entry_id in entry_ids}
-    kept: set[str] = set(original)
+    logger = logging.getLogger(__name__)
+
     try:
-        for start in range(0, len(entry_ids), chunk_size):
-            chunk = [entry_id.upper() for entry_id in entry_ids[start : start + chunk_size]]
-            payload = {
-                "query": (
-                    "query($ids:[String!]!){\n"
-                    "  entries(entry_ids:$ids){\n"
-                    "    rcsb_id\n"
-                    "    rcsb_accession_info{\n"
-                    "      is_obsolete\n"
-                    "    }\n"
-                    "  }\n"
-                    "}"
-                ),
-                "variables": {"ids": chunk},
-            }
-            response = sess.post(RCSB_GRAPHQL_URL, json=payload, timeout=timeout)
+        # Attempt fast-path via removed cache
+        if use_removed_cache:
+            try:
+                response = sess.get(f"{HOLDINGS_BASE}/removed/entry_ids", timeout=timeout)
+                response.raise_for_status()
+                removed_ids = {str(item).upper() for item in (response.json() or [])}
+                kept_ids = {
+                    entry.upper()
+                    for entry in entry_ids
+                    if entry.upper() not in removed_ids
+                }
+                return sorted(kept_ids)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Removed list fetch failed; falling back to status API: %s", exc
+                )
+
+        kept: set[str] = set()
+        for chunk in _chunked([entry.upper() for entry in entry_ids], chunk_size):
+            params = {"ids": ",".join(chunk)}
+            response = sess.get(f"{HOLDINGS_BASE}/status", params=params, timeout=timeout)
             response.raise_for_status()
-            data = response.json()
-            errors = data.get("errors")
-            if errors:
-                raise RuntimeError(f"GraphQL returned errors: {errors}")
-            for entry in data.get("data", {}).get("entries", []) or []:
-                entry_id = entry.get("rcsb_id")
-                info = entry.get("rcsb_accession_info") or {}
-                if entry_id and info.get("is_obsolete", False):
-                    kept.discard(entry_id.upper())
+            for record in response.json() or []:
+                pdb_id = str(record.get("pdb_id", "")).upper()
+                status = str(record.get("status", "")).upper()
+                if pdb_id and status != "OBSOLETE":
+                    kept.add(pdb_id)
+
+        if not kept:
+            raise RuntimeError(
+                "All candidate entries are obsolete or holdings/status returned empty."
+            )
+
+        return sorted(kept)
     finally:
         if own_session:
             sess.close()
-
-    return sorted(original & kept)
 
 
 def fetch_entry_ids_for_cath(
@@ -479,7 +499,11 @@ def fetch_entry_ids_for_cath(
         if allow_obsolete:
             return unique_ids
 
-        filtered_ids = filter_nonobsolete_entries(unique_ids, timeout=timeout, session=session)
+        filtered_ids = filter_nonobsolete_entries_rest(
+            unique_ids,
+            timeout=timeout,
+            session=session,
+        )
         if not filtered_ids:
             raise RuntimeError(
                 "All candidate entries are obsolete or failed Data API filtering for "
