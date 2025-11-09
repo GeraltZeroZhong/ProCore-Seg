@@ -23,6 +23,7 @@ Usage (CLI arguments override YAML config values):
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -42,10 +43,15 @@ from tqdm import tqdm
 
 LOGGER = logging.getLogger(__name__)
 
-RCSB_SEARCH_URL = "https://search.rcsb.org/rcsbsearch/v2/query"
 RCSB_GRAPHQL_URL = "https://data.rcsb.org/graphql"
 RCSB_REQUEST_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 DEFAULT_OUT_DIR = Path("./data/raw_pdbs")
+
+SEARCH_BASES_DEFAULT = [
+    "https://search.rcsb.org/rcsbsearch/v2/query",
+    "https://search-east.rcsb.org/rcsbsearch/v2/query",
+    "https://search-west.rcsb.org/rcsbsearch/v2/query",
+]
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,7 @@ class FetchConfig:
     log_level: str
     dry_run: bool
     self_test: bool
+    search_base: Optional[str]
 
 
 def parse_bool(value: Optional[str]) -> Optional[bool]:
@@ -130,6 +137,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Print sample payloads for diagnostics and exit.",
     )
+    parser.add_argument(
+        "--search-base",
+        type=str,
+        default="",
+        help=(
+            "Override the RCSB Search API base URL (default uses primary and mirror hosts)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -194,6 +209,14 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
             else:
                 self_test = bool(parse_bool(str(config_self_test)))
 
+    search_base = (args.search_base or "").strip()
+    if not search_base:
+        config_search_base = from_config("search_base")
+        if config_search_base is not None:
+            search_base = str(config_search_base).strip()
+    if not search_base:
+        search_base = None
+
     max_workers = int(max_workers)
     if max_workers < 1:
         raise ValueError("max_workers must be at least 1.")
@@ -225,20 +248,21 @@ def load_config(argv: Optional[Sequence[str]] = None) -> FetchConfig:
         log_level=log_level_str,
         dry_run=dry_run,
         self_test=self_test,
+        search_base=search_base,
     )
 
 
-def build_rcsb_cath_queries(
-    cath_id: str, allow_obsolete: bool, service: str = "text"
+def build_rcsb_cath_payloads(
+    cath_id: str, allow_obsolete: bool, attr_root: str, service: str = "text"
 ) -> list[dict]:
-    """Construct candidate JSON payloads for querying the RCSB Search API."""
+    """Construct candidate payloads for the RCSB Search API."""
 
     base_nodes: list[dict] = [
         {
             "type": "terminal",
             "service": service,
             "parameters": {
-                "attribute": "rcsb_polymer_instance_annotation.type",
+                "attribute": f"{attr_root}.type",
                 "operator": "exact_match",
                 "value": "CATH",
             },
@@ -249,7 +273,7 @@ def build_rcsb_cath_queries(
         "type": "terminal",
         "service": service,
         "parameters": {
-            "attribute": "rcsb_polymer_instance_annotation.annotation_lineage.id",
+            "attribute": f"{attr_root}.annotation_lineage.id",
             "operator": "contains_phrase",
             "value": cath_id,
         },
@@ -259,7 +283,7 @@ def build_rcsb_cath_queries(
         "type": "terminal",
         "service": service,
         "parameters": {
-            "attribute": "rcsb_polymer_instance_annotation.annotation_id",
+            "attribute": f"{attr_root}.annotation_id",
             "operator": "exact_match",
             "value": f"CATH:{cath_id}",
         },
@@ -269,14 +293,14 @@ def build_rcsb_cath_queries(
         "type": "terminal",
         "service": service,
         "parameters": {
-            "attribute": "rcsb_polymer_instance_annotation.annotation_id",
+            "attribute": f"{attr_root}.annotation_id",
             "operator": "exact_match",
             "value": cath_id,
         },
     }
 
     def _payload(nodes: list[dict]) -> dict:
-        query_nodes = list(base_nodes) + nodes
+        query_nodes = list(base_nodes) + list(nodes)
         if not allow_obsolete:
             query_nodes.append(
                 {
@@ -325,8 +349,27 @@ def _post_json(url: str, payload: dict, timeout: int) -> Response:
     return response
 
 
+def _post_with_diagnostics(
+    session: requests.Session, url: str, payload: dict, timeout: int
+) -> dict:
+    """POST JSON payload to the provided URL with detailed diagnostics."""
+
+    logger = logging.getLogger(__name__)
+    logger.debug("POST %s payload:\n%s", url, json.dumps(payload, indent=2, sort_keys=True))
+    response = session.post(url, headers=RCSB_REQUEST_HEADERS, json=payload, timeout=timeout)
+    if response.status_code >= 400:
+        snippet = (response.text or "")[:2000]
+        raise requests.HTTPError(
+            f"HTTP {response.status_code} at {url}; body[:2000]= {snippet}", response=response
+        )
+    try:
+        return response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Non-JSON response from {url}: {exc}") from exc
+
+
 def _search_with_paging(
-    session: requests.Session, payload: dict, timeout: int
+    session: requests.Session, url: str, payload: dict, timeout: int
 ) -> list[str]:
     """Submit the payload and collect all entry identifiers with pagination."""
 
@@ -339,30 +382,7 @@ def _search_with_paging(
     results: list[str] = []
     while True:
         paginate["start"] = start
-        LOGGER.debug(
-            "Submitting RCSB Search payload:\n%s",
-            json.dumps(working_payload, indent=2, sort_keys=True),
-        )
-        response = session.post(
-            RCSB_SEARCH_URL,
-            headers=RCSB_REQUEST_HEADERS,
-            json=working_payload,
-            timeout=timeout,
-        )
-        if response.status_code >= 400:
-            snippet = (response.text or "")[:2000]
-            LOGGER.warning(
-                "RCSB Search API HTTP %s. Payload=%s. Response snippet=%s",
-                response.status_code,
-                json.dumps(working_payload, separators=(",", ":")),
-                snippet,
-            )
-            message = (
-                f"HTTP {response.status_code} for {response.url}; first 2k chars: {snippet}"
-            )
-            raise requests.HTTPError(message, response=response)
-
-        data = response.json()
+        data = _post_with_diagnostics(session, url, working_payload, timeout)
         result_set = data.get("result_set", []) or []
         for item in result_set:
             identifier = item.get("identifier")
@@ -376,6 +396,27 @@ def _search_with_paging(
         if isinstance(total_count, int) and start >= total_count:
             break
     return results
+
+
+def _retry_as_polymer_entity(
+    session: requests.Session, url: str, payload: dict, timeout: int
+) -> list[str]:
+    """Retry the search as a polymer entity query and map identifiers to entries."""
+
+    polymer_payload = copy.deepcopy(payload)
+    polymer_payload["return_type"] = "polymer_entity"
+    identifiers = _search_with_paging(session, url, polymer_payload, timeout)
+    entries: list[str] = []
+    for identifier in identifiers:
+        if not isinstance(identifier, str):
+            continue
+        cleaned = identifier.strip()
+        if "_" not in cleaned:
+            continue
+        entry_part = cleaned.split("_", 1)[0]
+        if len(entry_part) >= 4:
+            entries.append(entry_part[:4].upper())
+    return entries
 
 
 def _filter_obsolete(entry_ids: Sequence[str], timeout: int) -> list[str]:
@@ -417,174 +458,73 @@ def _filter_obsolete(entry_ids: Sequence[str], timeout: int) -> list[str]:
     return filtered
 
 
-def _fallback_graphql_entries_for_cath(
-    session: requests.Session, cath_id: str, timeout: int, allow_obsolete: bool
+def fetch_entry_ids_for_cath(
+    cath_id: str,
+    timeout: int,
+    allow_obsolete: bool,
+    search_base: Optional[str] = None,
 ) -> list[str]:
-    """Fallback retrieval using the RCSB GraphQL endpoint."""
-
-    graphql_query = """
-    query ($cid: String!) {
-      polymer_entity_instances(query: {
-        type: "group"
-        logical_operator: "and"
-        nodes: [
-          {
-            type: "terminal"
-            service: "text"
-            parameters: {
-              attribute: "rcsb_polymer_instance_annotation.type"
-              operator: "exact_match"
-              value: "CATH"
-            }
-          }
-          {
-            type: "terminal"
-            service: "text"
-            parameters: {
-              attribute: "rcsb_polymer_instance_annotation.annotation_lineage.id"
-              operator: "contains_phrase"
-              value: $cid
-            }
-          }
-        ]
-      }) {
-        entry {
-          rcsb_id
-          entry_id
-          rcsb_accession_info {
-            is_obsolete
-          }
-        }
-        rcsb_polymer_instance_feature {
-          type
-          annotation_id
-          annotation_lineage {
-            id
-          }
-        }
-      }
-    }
-    """
-
-    payload = {"query": graphql_query, "variables": {"cid": cath_id}}
-    LOGGER.debug(
-        "GraphQL fallback payload:\n%s", json.dumps(payload, indent=2, sort_keys=True)
-    )
-    response = session.post(
-        RCSB_GRAPHQL_URL,
-        headers=RCSB_REQUEST_HEADERS,
-        json=payload,
-        timeout=timeout,
-    )
-    if response.status_code >= 400:
-        snippet = (response.text or "")[:2000]
-        LOGGER.warning(
-            "RCSB GraphQL HTTP %s. Payload=%s. Response snippet=%s",
-            response.status_code,
-            json.dumps(payload, separators=(",", ":")),
-            snippet,
-        )
-        raise requests.HTTPError(
-            f"HTTP {response.status_code} for {response.url}; first 2k chars: {snippet}",
-            response=response,
-        )
-
-    data = response.json()
-    if "errors" in data:
-        raise RuntimeError(f"GraphQL errors: {data['errors']}")
-
-    instances = data.get("data", {}).get("polymer_entity_instances") or []
-    collected: dict[str, bool] = {}
-    for instance in instances:
-        entry = instance.get("entry") or {}
-        entry_id = entry.get("rcsb_id") or entry.get("entry_id")
-        if not entry_id:
-            continue
-        is_obsolete = bool((entry.get("rcsb_accession_info") or {}).get("is_obsolete", False))
-        features = instance.get("rcsb_polymer_instance_feature") or []
-        for feature in features:
-            if feature.get("type") != "CATH":
-                continue
-            feature_id = feature.get("annotation_id") or ""
-            lineage = feature.get("annotation_lineage") or []
-            lineage_ids = {
-                node.get("id") for node in lineage if isinstance(node, dict) and node.get("id")
-            }
-            if (
-                feature_id == cath_id
-                or feature_id == f"CATH:{cath_id}"
-                or cath_id in lineage_ids
-            ):
-                collected[entry_id] = is_obsolete
-                break
-
-    if not collected:
-        return []
-
-    if not allow_obsolete:
-        return [entry_id for entry_id, obsolete in collected.items() if not obsolete]
-
-    return list(collected.keys())
-
-
-def fetch_entry_ids_for_cath(cath_id: str, timeout: int, allow_obsolete: bool) -> list[str]:
     """Fetch the list of PDB entry IDs annotated with the given CATH superfamily."""
 
     session = requests.Session()
-    errors: list[str] = []
-    try:
-        for payload in build_rcsb_cath_queries(cath_id, allow_obsolete):
-            try:
-                identifiers = _search_with_paging(session, payload, timeout)
-                normalized = sorted(
-                    {
-                        cleaned[:4].upper()
-                        for identifier in identifiers
-                        if isinstance(identifier, str)
-                        for cleaned in [identifier.strip()]
-                        if len(cleaned) >= 4
-                    }
-                )
-                if normalized:
-                    return normalized
-            except requests.HTTPError as exc:  # noqa: BLE001
-                LOGGER.warning("RCSB Search API failed: %s", exc)
-                errors.append(
-                    f"{exc}\nPAYLOAD={json.dumps(payload, separators=(',', ':'))}"
-                )
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("RCSB Search API exception: %s", exc)
-                errors.append(str(exc))
+    bases = [search_base] if search_base else SEARCH_BASES_DEFAULT
+    bases = [base for base in bases if base]
+    if not bases:
+        bases = SEARCH_BASES_DEFAULT
 
-        try:
-            fallback_ids = _fallback_graphql_entries_for_cath(
-                session, cath_id, timeout, allow_obsolete
-            )
-            normalized = sorted(
-                {
-                    cleaned[:4].upper()
-                    for entry in fallback_ids
-                    if isinstance(entry, str)
-                    for cleaned in [entry.strip()]
-                    if len(cleaned) >= 4
-                }
-            )
-            if normalized:
-                LOGGER.info(
-                    "Recovered %d entries via GraphQL fallback.",
-                    len(normalized),
-                )
-                return normalized
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"GraphQL fallback error: {exc}")
-            LOGGER.warning("GraphQL fallback failed: %s", exc)
+    errors: list[str] = []
+
+    def _normalize(ids: Sequence[str]) -> set[str]:
+        normalized: set[str] = set()
+        for identifier in ids:
+            if not isinstance(identifier, str):
+                continue
+            cleaned = identifier.strip()
+            if len(cleaned) >= 4:
+                normalized.add(cleaned[:4].upper())
+        return normalized
+
+    try:
+        for attr_root in (
+            "rcsb_polymer_instance_annotation",
+            "rcsb_polymer_entity_annotation",
+        ):
+            payloads = build_rcsb_cath_payloads(cath_id, allow_obsolete, attr_root)
+            for base in bases:
+                for payload in payloads:
+                    try:
+                        identifiers = _search_with_paging(session, base, payload, timeout)
+                        normalized = _normalize(identifiers)
+                        if not normalized:
+                            fallback_ids = _retry_as_polymer_entity(
+                                session, base, payload, timeout
+                            )
+                            normalized = _normalize(fallback_ids)
+                        if normalized:
+                            unique_ids = sorted(normalized)
+                            LOGGER.info(
+                                "Fetched %d entries for CATH %s via %s (%s).",
+                                len(unique_ids),
+                                cath_id,
+                                base,
+                                attr_root,
+                            )
+                            return unique_ids
+                    except requests.HTTPError as exc:  # noqa: BLE001
+                        compact_payload = json.dumps(payload, separators=(",", ":"))
+                        error_msg = f"{base} | {attr_root} | {exc} | PAYLOAD={compact_payload}"
+                        errors.append(error_msg)
+                        LOGGER.warning("Fetch error on %s / %s: %s", base, attr_root, exc)
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"{base} | {attr_root} | {exc}")
+                        LOGGER.warning("Fetch exception on %s / %s: %s", base, attr_root, exc)
     finally:
         session.close()
 
     if errors:
         raise RuntimeError(
             "Failed to fetch entry IDs for CATH ID "
-            f"{cath_id}. Attempts={len(errors)}. Last error:\n{errors[-1]}"
+            f"{cath_id}. Attempts={len(errors)}. Last error: {errors[-1]}"
         )
     raise RuntimeError(
         f"No entries found for CATH ID {cath_id}. Try without obsolete filter or verify CATH ID."
@@ -719,18 +659,21 @@ def _run_self_test() -> None:
 
     test_cath_id = "1.10.490.10"
     print(f"Self-test payloads for {test_cath_id} (allow_obsolete=False):")
-    queries = build_rcsb_cath_queries(test_cath_id, allow_obsolete=False)
-    for index, payload in enumerate(queries, start=1):
-        print(f"\nPayload {index}:")
-        print(json.dumps(payload, indent=2, sort_keys=True))
-
     boolean_nodes = []
-    for payload in queries:
-        nodes = payload.get("query", {}).get("nodes", [])
-        for node in nodes:
-            params = node.get("parameters", {})
-            if params.get("attribute") == "rcsb_accession_info.is_obsolete":
-                boolean_nodes.append(params.get("value"))
+    for root in (
+        "rcsb_polymer_instance_annotation",
+        "rcsb_polymer_entity_annotation",
+    ):
+        print(f"\nAttribute root: {root}")
+        queries = build_rcsb_cath_payloads(test_cath_id, allow_obsolete=False, attr_root=root)
+        for index, payload in enumerate(queries, start=1):
+            print(f"\nPayload {index}:")
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            nodes = payload.get("query", {}).get("nodes", [])
+            for node in nodes:
+                params = node.get("parameters", {})
+                if params.get("attribute") == "rcsb_accession_info.is_obsolete":
+                    boolean_nodes.append(params.get("value"))
     if not boolean_nodes:
         raise AssertionError("Self-test expected obsolete filter nodes to be present.")
     for value in boolean_nodes:
@@ -761,14 +704,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     LOGGER.info("Starting mmCIF fetch for CATH ID %s", config.cath_id)
 
     if config.dry_run:
-        payloads = build_rcsb_cath_queries(config.cath_id, config.allow_obsolete)
-        if payloads:
-            LOGGER.info(
-                "Dry run requested; first payload candidate:\n%s",
-                json.dumps(payloads[0], indent=2, sort_keys=True),
+        for root in (
+            "rcsb_polymer_instance_annotation",
+            "rcsb_polymer_entity_annotation",
+        ):
+            payloads = build_rcsb_cath_payloads(
+                config.cath_id, config.allow_obsolete, attr_root=root
             )
-        else:
-            LOGGER.warning("Dry run requested but no payloads were generated.")
+            if payloads:
+                LOGGER.info(
+                    "Dry run payload for %s:\n%s",
+                    root,
+                    json.dumps(payloads[0], indent=2, sort_keys=True),
+                )
+                print(json.dumps(payloads[0], indent=2, sort_keys=True))
+            else:
+                LOGGER.warning("Dry run generated no payloads for %s.", root)
         return 0
 
     try:
@@ -782,6 +733,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             config.cath_id,
             timeout=config.timeout,
             allow_obsolete=config.allow_obsolete,
+            search_base=config.search_base,
         )
         LOGGER.info("Identified %d entry IDs for CATH ID %s", len(entry_ids), config.cath_id)
     except Exception as exc:  # noqa: BLE001
