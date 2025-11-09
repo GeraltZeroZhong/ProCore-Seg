@@ -246,10 +246,10 @@ Runs the trained segmentation model over curated HDF5 entries, writing compresse
 
 ```bash
 python -m procore_seg.main_cli infer \
-  --model-path "$WORK_DIR/checkpoints/segment/best.pth" \
+  --model "$WORK_DIR/checkpoints/segment/best.pth" \
   --data-dir "$WORK_DIR/processed" \
   --out-dir "$WORK_DIR/inference" \
-  --batch-size 4 \
+  --batch 4 \
   --workers 4 \
   --voxel-size 1.0 \
   --temperature 1.0
@@ -267,19 +267,25 @@ Aggregate metrics (precision/recall, ROC/AUPR, bootstrap confidence intervals) a
 
 ```bash
 python -m procore_seg.main_cli eval \
-  --in-dir "$WORK_DIR/inference" \
+  --run-dir "$WORK_DIR/inference" \
   --out-dir "$WORK_DIR/reports" \
-  --positive-class 1 \
-  --bootstrap 1000
+  --config "$WORK_DIR/configs/eval.yaml" \
+  --n-bootstrap 1000
 ```
 
-The evaluator automatically leverages pandas for rich tables when installed and falls back to pure NumPy otherwise.
+The evaluator automatically leverages pandas for rich tables when installed and falls back to pure NumPy otherwise. Set the positive class, confidence interval level, or other evaluation options in the YAML provided to `--config`, for example:
+
+```yaml
+# $WORK_DIR/configs/eval.yaml
+positive_class: 1
+core_percentiles: [5, 50, 95]
+```
 
 ### Visualisation & case studies
 
-- **PyMOL overlays:** `python -m procore_seg.main_cli export-pymol --in-dir "$WORK_DIR/inference" --out-dir "$WORK_DIR/pymol"` to generate session files that colour residues by predicted class.
-- **Static plots:** `python -m procore_seg.main_cli plots --in-dir "$WORK_DIR/reports"` for publication-ready figures.
-- **Interactive gallery:** `python -m procore_seg.main_cli gallery --in-dir "$WORK_DIR/inference" --out "$WORK_DIR/gallery/index.html"` to browse representative examples.
+- **PyMOL overlays:** `python -m procore_seg.main_cli export-pymol --h5 "$WORK_DIR/processed/1ABC.h5" --npz "$WORK_DIR/inference/1ABC.npz" --out "$WORK_DIR/pymol/1ABC.seg.pdb"` converts a single structure into a PyMOL-ready PDB/PML pair (pass `--mode label` to colour by discrete predictions).
+- **Static plots:** `python -m procore_seg.main_cli plots --per-protein "$WORK_DIR/reports/per_protein.csv" --aggregate "$WORK_DIR/reports/aggregate.json" --out-dir "$WORK_DIR/figures"` generates publication-ready figures; tweak formats, DPI, or styling with `--formats`, `--dpi`, and `--style`.
+- **Interactive gallery:** `python -m procore_seg.main_cli gallery --per-protein "$WORK_DIR/reports/per_protein.csv" --npz-dir "$WORK_DIR/inference" --h5-dir "$WORK_DIR/processed" --out-md "$WORK_DIR/gallery/index.md" --k 12` compiles top/bottom cases, optionally rendering thumbnails with `--render-thumbnails true`.
 
 All visualisation commands operate purely on inference outputs; no retraining is required.
 
