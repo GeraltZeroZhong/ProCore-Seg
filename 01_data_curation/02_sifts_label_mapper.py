@@ -478,12 +478,6 @@ def filter_cath_features(
         if not isinstance(auth_asym_id, str):
             continue
 
-        annotations = instance.get("annotations") or []
-        annotation_match = any(
-            _annotation_matches_superfamily(annotation, cath_superfamily)
-            for annotation in annotations
-        )
-
         features = instance.get("features") or []
         for feature in features:
             if feature.get("type") != "CATH":
@@ -492,9 +486,10 @@ def filter_cath_features(
             if feature.get("provenance_source") != "CATH":
                 continue
 
-            if cath_superfamily and not (
-                annotation_match or _feature_matches_superfamily(feature, cath_superfamily)
-            ):
+            feature_match = _feature_matches_superfamily(feature, cath_superfamily)
+            if cath_superfamily and not feature_match:
+                # Avoid letting unrelated CATH superfamilies through when one
+                # matching annotation exists for the chain.
                 continue
 
             positions = feature.get("positions") or []
