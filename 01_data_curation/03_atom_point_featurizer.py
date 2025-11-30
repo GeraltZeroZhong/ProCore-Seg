@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import shutil
 import urllib.error
+from contextlib import redirect_stderr
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -361,7 +362,12 @@ def _prepare_structure_for_fibos(
         return None
 
     if suffixes.endswith(".pdb"):
-        return structure_path, _noop_cleanup
+        sanitized, sanitize_cleanup = _sanitize_pdb_for_fibos(structure_path)
+
+        def _cleanup() -> None:
+            sanitize_cleanup()
+
+        return sanitized, _cleanup
 
     parent_dir = structure_path.parent
     stemmed_pdb = parent_dir / f"{structure_path.stem}.pdb"
@@ -374,7 +380,13 @@ def _prepare_structure_for_fibos(
         def _cleanup() -> None:
             stemmed_pdb.unlink(missing_ok=True)
 
-        return stemmed_pdb, _cleanup
+        sanitized, sanitize_cleanup = _sanitize_pdb_for_fibos(stemmed_pdb)
+
+        def _composite_cleanup() -> None:
+            sanitize_cleanup()
+            _cleanup()
+
+        return sanitized, _composite_cleanup
 
     io = PDBIO()
     io.set_structure(structure)
@@ -383,7 +395,64 @@ def _prepare_structure_for_fibos(
     def _cleanup() -> None:
         stemmed_pdb.unlink(missing_ok=True)
 
-    return stemmed_pdb, _cleanup
+    sanitized, sanitize_cleanup = _sanitize_pdb_for_fibos(stemmed_pdb)
+
+    def _composite_cleanup() -> None:
+        sanitize_cleanup()
+        _cleanup()
+
+    return sanitized, _composite_cleanup
+
+
+def _sanitize_pdb_for_fibos(structure_path: Path) -> tuple[Path, Callable[[], None]]:
+    """Filter malformed atom records that fibos fails to parse.
+
+    The legacy fibos Fortran reader expects integer residue and atom serial
+    fields and well-formed floating-point coordinates. Some experimental PDB
+    files contain placeholders or other non-numeric tokens that trigger a
+    Fortran runtime error (``Bad value during integer read``). To shield the
+    downstream occluded surface computation we create a temporary copy with
+    malformed ``ATOM`` / ``HETATM`` records removed.
+    """
+
+    tmp_path = structure_path.with_suffix(structure_path.suffix + ".fibos_safe")
+    removed = 0
+
+    try:
+        with structure_path.open("r") as src, tmp_path.open("w") as dst:
+            for line in src:
+                if not line.startswith(("ATOM", "HETATM")):
+                    dst.write(line)
+                    continue
+
+                serial_field = line[6:11]
+                resseq_field = line[22:26]
+                try:
+                    int(serial_field)
+                    int(resseq_field)
+                    float(line[30:38])
+                    float(line[38:46])
+                    float(line[46:54])
+                except ValueError:
+                    removed += 1
+                    continue
+
+                dst.write(line)
+    except FileNotFoundError:
+        return structure_path, lambda: None
+
+    if removed == 0:
+        tmp_path.unlink(missing_ok=True)
+        return structure_path, lambda: None
+
+    LOGGER.debug(
+        "Filtered %d malformed atom records from %s prior to fibos", removed, structure_path
+    )
+
+    def _cleanup() -> None:
+        tmp_path.unlink(missing_ok=True)
+
+    return tmp_path, _cleanup
 
 
 def compute_residue_osp(
@@ -761,6 +830,8 @@ def _call_fibos_occluded_surface_sandboxed(
         details = ""
         if isinstance(payload, dict) and payload.get("error"):
             details = f": {payload['error']}"
+        elif exit_code == 2:
+            details = ": fibos reader failed to parse one or more atom records"
         raise RuntimeError(
             f"fibos.occluded_surface subprocess exited with code {exit_code}{details}"
         )
@@ -788,9 +859,12 @@ def _fibos_occluded_surface_worker(
         if not callable(occluded_surface):
             raise RuntimeError("fibos.occluded_surface is unavailable")
 
-        result = _call_fibos_occluded_surface(
-            occluded_surface, structure_path, out_dir, prot_name
-        )
+        with open(os.devnull, "w", encoding="utf-8") as devnull, redirect_stderr(
+            devnull
+        ):
+            result = _call_fibos_occluded_surface(
+                occluded_surface, structure_path, out_dir, prot_name
+            )
         result_queue.put({"ok": True, "result": result})
     except Exception as exc:  # pragma: no cover - defensive
         result_queue.put({"ok": False, "error": repr(exc)})
