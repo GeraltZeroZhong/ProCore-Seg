@@ -74,6 +74,15 @@ def build_graphql_query() -> str:
         "          description\n"
         "          provenance_source\n"
         "          feature_id\n"
+        "          assignment_version\n"
+        "          annotation_lineage {\n"
+        "            id\n"
+        "            name\n"
+        "          }\n"
+        "          additional_properties {\n"
+        "            name\n"
+        "            values\n"
+        "          }\n"
         "          feature_positions {\n"
         "            beg_seq_id\n"
         "            end_seq_id\n"
@@ -341,6 +350,15 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
     return normalized_instances
 
 
+def dump_instance_debug(payload: List[Dict[str, object]], out_path: Path) -> None:
+    """Persist normalized instance features for debugging."""
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    LOGGER.info("Wrote raw feature payload to %s", out_path)
+
+
 def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: str) -> bool:
     """Check if a feature matches the target CATH superfamily."""
 
@@ -415,6 +433,13 @@ def filter_cath_features(
 
             cath_ranges.setdefault(auth_asym_id, []).extend(valid_positions)
 
+        if not cath_superfamily and features:
+            LOGGER.debug(
+                "Instance %s retained %d CATH features (no superfamily filter)",
+                auth_asym_id,
+                len(features),
+            )
+
     def _range_sort_key(span: Tuple[str, str, str, str]) -> Tuple[object, ...]:
         beg_seq, beg_ins, end_seq, end_ins = span
         beg_num = _extract_seq_number(beg_seq)
@@ -434,6 +459,11 @@ def filter_cath_features(
         result.append((auth_asym_id, sorted_ranges))
 
     result.sort(key=lambda item: item[0])
+    LOGGER.debug(
+        "Retained CATH annotations for %d instance(s) after filtering on %s",
+        len(result),
+        cath_superfamily or "any",
+    )
     return result
 
 
@@ -521,6 +551,10 @@ def main() -> int:
     parser.add_argument("--cath-superfamily", help="CATH superfamily identifier to filter on")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout for GraphQL requests (seconds)")
     parser.add_argument(
+        "--debug-dump",
+        help="Optional path to write the raw normalized GraphQL payload for inspection",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level"
     )
 
@@ -531,6 +565,8 @@ def main() -> int:
     try:
         normalized_id = normalize_pdb_id(args.pdb_id)
         instances = fetch_instance_features(normalized_id, args.timeout)
+        if args.debug_dump:
+            dump_instance_debug(instances, Path(args.debug_dump))
         cath_features = filter_cath_features(instances, args.cath_superfamily)
         mapping = expand_ranges_to_map(cath_features)
 
