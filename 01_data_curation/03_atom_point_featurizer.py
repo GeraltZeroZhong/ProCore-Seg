@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from Bio.PDB import MMCIFParser, PDBParser
@@ -334,9 +336,20 @@ def compute_residue_sasa(
 
 
 def compute_residue_osp(
-    structure_path: Path, allow_missing: bool
+    structure_path: Path, allow_missing: bool, default_chain_id: str | None = None
 ) -> Tuple[Dict[Tuple[str, int, str], float], str]:
-    """Compute residue packing density using fibos OSP."""
+    """Compute residue packing density using fibos OSP.
+
+    Parameters
+    ----------
+    structure_path:
+        Path to the structure file passed to fibos.
+    allow_missing:
+        Whether failures should fall back to zero-valued densities.
+    default_chain_id:
+        Fallback chain identifier to use when the fibos result omits chain
+        information (e.g., when processing single-chain structures).
+    """
 
     try:
         from fibos import osp as fibos_osp
@@ -347,14 +360,17 @@ def compute_residue_osp(
             return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
 
+    shim = _ensure_os_create_folder_shim()
     try:
-        raw_result = fibos_osp(str(structure_path))
+        raw_result = _call_fibos_osp(fibos_osp, structure_path)
     except Exception as exc:  # pragma: no cover - external tool failure
         msg = f"fibos.osp failed for {structure_path}: {exc}"
         if allow_missing:
             LOGGER.warning("%s; filling OSP with zeros", msg)
             return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
+    finally:
+        shim.restore()
 
     osp_map: Dict[Tuple[str, int, str], float] = {}
     osp_source = "fibos"
@@ -409,28 +425,26 @@ def compute_residue_osp(
         )
         resseq_col = _first_present_column(
             df.columns,
-            ["resseq", "auth_seq_id", "seq_id", "residue_number", "res_id"],
+            ["resseq", "auth_seq_id", "seq_id", "residue_number", "res_id", "resnum"],
         )
         icode_col = _first_present_column(
             df.columns, ["icode", "ins_code", "insertion_code", "auth_ins_code"]
         )
         osp_col = _first_present_column(df.columns, ["osp", "density", "packing_density"])
 
-        required_missing = [
-            name
-            for name, col in {
-                "chain": chain_col,
-                "resseq": resseq_col,
-                "icode": icode_col,
-                "osp": osp_col,
-            }.items()
-            if col is None
-        ]
+        required_missing = []
+        if chain_col is None and default_chain_id is None:
+            required_missing.append("chain")
+        if resseq_col is None:
+            required_missing.append("resseq")
+        if osp_col is None:
+            required_missing.append("osp")
         if required_missing:
             if allow_missing:
                 LOGGER.warning(
-                    "fibos.osp result missing columns %s; filling OSP with zeros",
+                    "fibos.osp result missing columns %s (available=%s); filling OSP with zeros",
                     ", ".join(required_missing),
+                    ", ".join(str(col) for col in df.columns),
                 )
                 return {}, "zero_fallback"
             raise RuntimeError(
@@ -438,7 +452,10 @@ def compute_residue_osp(
             )
 
         for _, row in df.iterrows():
-            chain_id = str(row[chain_col])
+            if chain_col is not None:
+                chain_id = str(row[chain_col])
+            else:
+                chain_id = default_chain_id
             try:
                 resseq = _normalize_resseq(row[resseq_col])
             except StructureParsingError:
@@ -458,11 +475,97 @@ def compute_residue_osp(
     return osp_map, osp_source
 
 
-def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
+class _OsCreateFolderShim:
+    """Context-style helper that temporarily injects ``os.create_folder``."""
+
+    def __init__(self, original: Optional[Callable[..., object]]) -> None:
+        self._original = original
+
+    def restore(self) -> None:
+        """Restore the original ``os.create_folder`` binding if it was absent."""
+
+        if self._original is not None:
+            return
+        try:
+            delattr(os, "create_folder")
+        except Exception:
+            LOGGER.debug("Unable to remove temporary os.create_folder shim")
+
+
+def _ensure_os_create_folder_shim() -> _OsCreateFolderShim:
+    """Install a minimal ``os.create_folder`` shim for fibos if missing."""
+
+    original = getattr(os, "create_folder", None)
+    if callable(original):
+        return _OsCreateFolderShim(original)
+
+    def _create_folder(path: str | Path, exist_ok: bool = True) -> None:
+        Path(path).mkdir(parents=True, exist_ok=exist_ok)
+
+    os.create_folder = _create_folder  # type: ignore[attr-defined]
+    LOGGER.debug("Installed temporary os.create_folder shim for fibos")
+    return _OsCreateFolderShim(None)
+
+
+def _first_present_column(columns: Sequence[object], candidates: Sequence[str]) -> str | None:
+    """Return the first column name matching any candidate (case-insensitive)."""
+
+    lowered_to_original = {str(col).lower(): str(col) for col in columns}
     for cand in candidates:
-        if cand in columns:
-            return cand
+        match = lowered_to_original.get(cand.lower())
+        if match is not None:
+            return match
     return None
+
+
+def _call_fibos_osp(
+    fibos_osp: Callable[..., object], structure_path: Path
+) -> object:
+    """Call ``fibos.osp`` with optional ``prot_name`` support when available.
+
+    Some fibos versions expect a ``prot_name`` keyword and raise
+    ``UnboundLocalError`` when it is absent. This helper inspects the callable
+    signature and supplies a sensible default when supported, falling back to a
+    positional-only invocation otherwise.
+
+    Parameters
+    ----------
+    fibos_osp:
+        The ``fibos.osp`` callable.
+    structure_path:
+        Path to the structure file passed through to fibos.
+
+    Returns
+    -------
+    object
+        The raw result from ``fibos.osp``.
+    """
+
+    kwargs: Dict[str, object] = {}
+    prot_name = structure_path.stem
+    try:
+        if "prot_name" in inspect.signature(fibos_osp).parameters:
+            kwargs["prot_name"] = prot_name
+    except (TypeError, ValueError):  # pragma: no cover - built-in/partial callable
+        pass
+
+    try:
+        return fibos_osp(str(structure_path), **kwargs)
+    except UnboundLocalError:
+        LOGGER.debug(
+            "Retrying fibos.osp with prot_name after UnboundLocalError for %s", structure_path
+        )
+        return fibos_osp(str(structure_path), prot_name=prot_name)
+    except TypeError as exc:
+        if kwargs:
+            LOGGER.debug(
+                "Retrying fibos.osp without keyword args after TypeError: %s", exc
+            )
+            try:
+                return fibos_osp(str(structure_path))
+            except TypeError as exc2:
+                raise exc2 from exc
+        raise
 
 
 def build_arrays(
@@ -481,7 +584,11 @@ def build_arrays(
         raise RuntimeError("No heavy atoms were found in the structure")
 
     sasa_map = compute_residue_sasa(structure, probe_radius, n_points)
-    osp_map, osp_source = compute_residue_osp(structure_path, allow_missing_density)
+    chain_ids = {chain_id for _, chain_id, _, _ in atoms_info}
+    default_chain_id = next(iter(chain_ids)) if len(chain_ids) == 1 else None
+    osp_map, osp_source = compute_residue_osp(
+        structure_path, allow_missing_density, default_chain_id=default_chain_id
+    )
 
     n_atoms = len(atoms_info)
     coords = np.empty((n_atoms, 3), dtype=np.float32)
