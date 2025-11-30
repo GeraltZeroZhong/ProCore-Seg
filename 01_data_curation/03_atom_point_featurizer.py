@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -350,7 +351,7 @@ def compute_residue_osp(
 
     shim = _ensure_os_create_folder_shim()
     try:
-        raw_result = fibos_osp(str(structure_path))
+        raw_result = _call_fibos_osp(fibos_osp, structure_path)
     except Exception as exc:  # pragma: no cover - external tool failure
         msg = f"fibos.osp failed for {structure_path}: {exc}"
         if allow_missing:
@@ -500,6 +501,47 @@ def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> 
         if match is not None:
             return match
     return None
+
+
+def _call_fibos_osp(
+    fibos_osp: Callable[..., object], structure_path: Path
+) -> object:
+    """Call ``fibos.osp`` with optional ``prot_name`` support when available.
+
+    Some fibos versions expect a ``prot_name`` keyword and raise
+    ``UnboundLocalError`` when it is absent. This helper inspects the callable
+    signature and supplies a sensible default when supported, falling back to a
+    positional-only invocation otherwise.
+
+    Parameters
+    ----------
+    fibos_osp:
+        The ``fibos.osp`` callable.
+    structure_path:
+        Path to the structure file passed through to fibos.
+
+    Returns
+    -------
+    object
+        The raw result from ``fibos.osp``.
+    """
+
+    kwargs: Dict[str, object] = {}
+    try:
+        if "prot_name" in inspect.signature(fibos_osp).parameters:
+            kwargs["prot_name"] = structure_path.stem
+    except (TypeError, ValueError):  # pragma: no cover - built-in/partial callable
+        pass
+
+    try:
+        return fibos_osp(str(structure_path), **kwargs)
+    except TypeError as exc:
+        if kwargs:
+            LOGGER.debug(
+                "Retrying fibos.osp without keyword args after TypeError: %s", exc
+            )
+            return fibos_osp(str(structure_path))
+        raise
 
 
 def build_arrays(
