@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import shutil
-import tempfile
 import urllib.error
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -348,7 +347,8 @@ def _prepare_structure_for_fibos(
 
     * returning the original path when it already points to a PDB file,
     * inflating ``.pdb.gz`` inputs to a temporary ``.pdb`` in the same folder,
-    * exporting mmCIF inputs to a temporary PDB using :class:`Bio.PDB.PDBIO`.
+    * exporting mmCIF inputs to a temporary PDB named after the original stem
+      (e.g., ``kqlv.pdb``) using :class:`Bio.PDB.PDBIO`.
 
     The accompanying cleanup callable removes any temporary artefacts so callers
     can safely invoke it in a ``finally`` block.
@@ -363,36 +363,34 @@ def _prepare_structure_for_fibos(
         return structure_path, _noop_cleanup
 
     parent_dir = structure_path.parent
+    stemmed_pdb = parent_dir / f"{structure_path.stem}.pdb"
 
     if suffixes.endswith(".pdb.gz"):
         with gzip.open(structure_path, "rt") as src:
-            with tempfile.NamedTemporaryFile(
-                "w", delete=False, suffix=".pdb", dir=parent_dir
-            ) as handle:
+            with stemmed_pdb.open("w") as handle:
                 shutil.copyfileobj(src, handle)
-                temp_path = Path(handle.name)
 
         def _cleanup() -> None:
-            temp_path.unlink(missing_ok=True)
+            stemmed_pdb.unlink(missing_ok=True)
 
-        return temp_path, _cleanup
+        return stemmed_pdb, _cleanup
 
-    with tempfile.NamedTemporaryFile(
-        "w", delete=False, suffix=".pdb", dir=parent_dir
-    ) as handle:
-        temp_path = Path(handle.name)
-        io = PDBIO()
-        io.set_structure(structure)
-        io.save(str(temp_path))
+    io = PDBIO()
+    io.set_structure(structure)
+    io.save(str(stemmed_pdb))
 
     def _cleanup() -> None:
-        temp_path.unlink(missing_ok=True)
+        stemmed_pdb.unlink(missing_ok=True)
 
-    return temp_path, _cleanup
+    return stemmed_pdb, _cleanup
 
 
 def compute_residue_osp(
-    structure_path: Path, allow_missing: bool, default_chain_id: str | None = None
+    structure_path: Path,
+    allow_missing: bool,
+    default_chain_id: str | None = None,
+    *,
+    prot_name: str | None = None,
 ) -> Tuple[Dict[Tuple[str, int, str], float], str]:
     """Compute residue packing density using fibos OSP.
 
@@ -405,6 +403,10 @@ def compute_residue_osp(
     default_chain_id:
         Fallback chain identifier to use when the fibos result omits chain
         information (e.g., when processing single-chain structures).
+    prot_name:
+        Preferred identifier to hand to fibos (e.g., the 4-letter PDB code)
+        so SRF naming stays stable even when the structure path comes from a
+        temporary mmCIF-to-PDB conversion.
 
     Callers should provide a real PDB filepath (see
     :func:`_prepare_structure_for_fibos`) so fibos does not attempt to invent
@@ -424,16 +426,21 @@ def compute_residue_osp(
             return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
 
-    srf_path = _build_fibos_srf_path(structure_path)
+    resolved_prot_name = prot_name or structure_path.stem
+    srf_path = _build_fibos_srf_path(structure_path, prot_name=resolved_prot_name)
     shim = _ensure_os_create_folder_shim()
     try:
         resolved_srf = _ensure_fibos_srf_file(
-            fibos, structure_path, srf_path, allow_missing=allow_missing
+            fibos,
+            structure_path,
+            srf_path,
+            allow_missing=allow_missing,
+            prot_name=resolved_prot_name,
         )
         if resolved_srf is None:
             return {}, "zero_fallback"
         raw_result = _call_fibos_osp(
-            fibos_osp, resolved_srf, prot_name=structure_path.stem
+            fibos_osp, resolved_srf, prot_name=resolved_prot_name
         )
     except Exception as exc:  # pragma: no cover - external tool failure
         msg = (
@@ -593,10 +600,16 @@ def _first_present_column(columns: Sequence[object], candidates: Sequence[str]) 
     return None
 
 
-def _build_fibos_srf_path(structure_path: Path) -> Path:
-    """Construct the expected SRF path produced by ``fibos.occluded_surface``."""
+def _build_fibos_srf_path(structure_path: Path, *, prot_name: str | None = None) -> Path:
+    """Construct the expected SRF path produced by ``fibos.occluded_surface``.
 
-    return structure_path.parent / "fibos_files" / f"prot_{structure_path.stem}.srf"
+    When a custom ``prot_name`` is provided (e.g., the original 4-letter PDB
+    identifier), the SRF name stays stable even if the structure path comes from
+    a temporary conversion.
+    """
+
+    base = prot_name or structure_path.stem
+    return structure_path.parent / "fibos_files" / f"prot_{base}.srf"
 
 
 def _ensure_fibos_srf_file(
@@ -605,6 +618,7 @@ def _ensure_fibos_srf_file(
     srf_path: Path,
     *,
     allow_missing: bool,
+    prot_name: str,
 ) -> Path | None:
     """Ensure an SRF file exists for ``fibos.osp`` to consume.
 
@@ -631,11 +645,11 @@ def _ensure_fibos_srf_file(
     srf_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         result = _call_fibos_occluded_surface(
-            occluded_surface, structure_path, srf_path.parent
+            occluded_surface, structure_path, srf_path.parent, prot_name
         )
     except urllib.error.HTTPError as exc:  # pragma: no cover - network dependent
         status = getattr(exc, "code", None)
-        pdb_id = structure_path.stem[:4].upper()
+        pdb_id = prot_name[:4].upper()
         msg = (
             f"fibos.occluded_surface HTTP {status or 'error'} when fetching {pdb_id}"
         )
@@ -669,20 +683,41 @@ def _ensure_fibos_srf_file(
 
 
 def _call_fibos_occluded_surface(
-    occluded_surface: Callable[..., object], structure_path: Path, out_dir: Path
+    occluded_surface: Callable[..., object],
+    structure_path: Path,
+    out_dir: Path,
+    prot_name: str,
 ) -> object:
-    """Call ``fibos.occluded_surface`` with best-effort signature detection."""
+    """Call ``fibos.occluded_surface`` with best-effort signature detection.
 
-    prot_name = structure_path.stem
+    The helper prefers signatures that accept an explicit ``file_path`` so fibos
+    uses the on-disk PDB we prepared rather than constructing ``<prot>.pdb`` in
+    the current working directory.
+    """
+
     try:
         return occluded_surface(
-            str(structure_path), out_folder=str(out_dir), prot_name=prot_name
+            file_path=str(structure_path),
+            out_folder=str(out_dir),
+            prot_name=prot_name,
         )
     except TypeError:
         try:
-            return occluded_surface(str(structure_path), out_folder=str(out_dir))
+            return occluded_surface(
+                file_path=str(structure_path), out_folder=str(out_dir)
+            )
         except TypeError:
-            return occluded_surface(str(structure_path))
+            try:
+                return occluded_surface(
+                    str(structure_path), out_folder=str(out_dir), prot_name=prot_name
+                )
+            except TypeError:
+                try:
+                    return occluded_surface(
+                        str(structure_path), out_folder=str(out_dir)
+                    )
+                except TypeError:
+                    return occluded_surface(str(structure_path))
 
 
 def _call_fibos_osp(
@@ -733,6 +768,7 @@ def build_arrays(
             fibos_structure_path,
             allow_missing_density,
             default_chain_id=default_chain_id,
+            prot_name=structure_path.stem,
         )
     finally:
         cleanup_fibos()
