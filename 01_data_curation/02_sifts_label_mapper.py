@@ -59,29 +59,36 @@ def build_graphql_query() -> str:
     """Return the GraphQL query for fetching polymer entity instances."""
 
     return (
-        "query($entry_id: String!) {\n"
-        "  entry(entry_id: $entry_id) {\n"
-        "    polymer_entity_instances {\n"
-        "      rcsb_polymer_entity_instance_container_identifiers {\n"
-        "        auth_asym_id\n"
-        "        label_asym_id\n"
-        "        polymer_entity_id\n"
-        "      }\n"
-        "      rcsb_polymer_instance_feature {\n"
-        "        type\n"
-        "        name\n"
-        "        description\n"
-        "        provenance_source\n"
-        "        feature_id\n"
-        "        feature_positions {\n"
-        "          beg_seq_id\n"
-        "          beg_ins_code\n"
-        "          end_seq_id\n"
-        "          end_ins_code\n"
+        "query($entry_id: [String!]!) {\n"
+        "  entries(entry_ids: $entry_id) {\n"
+        "    polymer_entities {\n"
+        "      polymer_entity_instances {\n"
+        "        rcsb_polymer_entity_instance_container_identifiers {\n"
+        "          asym_id\n"
+        "          auth_asym_id\n"
+        "          auth_to_entity_poly_seq_mapping\n"
+        "          entity_id\n"
         "        }\n"
-        "        related_database_citations {\n"
-        "          database_name\n"
-        "          accession\n"
+        "        rcsb_polymer_instance_feature {\n"
+        "          type\n"
+        "          feature_id\n"
+        "          name\n"
+        "          provenance_source\n"
+        "          assignment_version\n"
+        "          description\n"
+        "          feature_positions {\n"
+        "            beg_seq_id\n"
+        "            end_seq_id\n"
+        "          }\n"
+        "          annotation_lineage {\n"
+        "            depth\n"
+        "            id\n"
+        "            name\n"
+        "          }\n"
+        "          additional_properties {\n"
+        "            name\n"
+        "            values\n"
+        "          }\n"
         "        }\n"
         "      }\n"
         "    }\n"
@@ -217,7 +224,7 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
 
     normalized_id = normalize_pdb_id(pdb_id)
     query = build_graphql_query()
-    payload = {"query": query, "variables": {"entry_id": normalized_id}}
+    payload = {"query": query, "variables": {"entry_id": [normalized_id]}}
 
     LOGGER.debug("GraphQL query payload: %s", json.dumps(payload, sort_keys=True))
 
@@ -245,19 +252,26 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
         raise RuntimeError("GraphQL response was not valid JSON") from exc
 
     if "errors" in payload and payload["errors"]:
-        first_error = payload["errors"][0]
-        message = first_error.get("message", "Unknown GraphQL error")
-        raise RuntimeError(f"GraphQL response contained errors: {message}")
+        messages = [err.get("message", "Unknown GraphQL error") for err in payload["errors"]]
+        LOGGER.debug("GraphQL errors for %s: %s", normalized_id, payload["errors"])
+        raise RuntimeError(
+            "GraphQL response contained errors: " + "; ".join(messages)
+        )
 
     data = payload.get("data")
     if not data or not isinstance(data, dict):
         raise RuntimeError("GraphQL response missing 'data' field")
 
-    entry = data.get("entry")
-    if not entry:
+    entries = data.get("entries")
+    if not entries:
         raise RuntimeError(f"Entry '{normalized_id}' was not found in RCSB data")
 
-    instances = entry.get("polymer_entity_instances")
+    instances: List[Dict[str, object]] = []
+    for entry in entries:
+        for entity in entry.get("polymer_entities") or []:
+            entity_instances = entity.get("polymer_entity_instances") or []
+            instances.extend(entity_instances)
+
     if not instances:
         raise RuntimeError(
             f"Entry '{normalized_id}' does not contain polymer entity instances"
@@ -288,8 +302,10 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
                 if beg_seq is None or end_seq is None:
                     LOGGER.debug("Skipping malformed feature position: %s", pos)
                     continue
-                beg_ins = _extract_ins_code(beg_seq, pos.get("beg_ins_code"))
-                end_ins = _extract_ins_code(end_seq, pos.get("end_ins_code"))
+                # New API no longer returns insertion codes separately; derive from
+                # the sequence identifier if present.
+                beg_ins = _extract_ins_code(beg_seq, None)
+                end_ins = _extract_ins_code(end_seq, None)
                 positions.append((beg_seq, beg_ins, end_seq, end_ins))
 
             if not positions:
@@ -298,12 +314,13 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
             normalized_features.append(
                 {
                     "type": feature.get("type"),
+                    "feature_id": feature.get("feature_id"),
                     "name": feature.get("name"),
                     "description": feature.get("description"),
+                    "assignment_version": feature.get("assignment_version"),
                     "positions": positions,
-                    "related_database_citations": feature.get(
-                        "related_database_citations"
-                    )
+                    "annotation_lineage": feature.get("annotation_lineage") or [],
+                    "additional_properties": feature.get("additional_properties")
                     or [],
                 }
             )
@@ -339,17 +356,24 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     if isinstance(description, str) and target in description:
         return True
 
-    citations = feature.get("related_database_citations") or []
-    for citation in citations:
-        if not isinstance(citation, dict):
+    lineage = feature.get("annotation_lineage") or []
+    for node in lineage:
+        if not isinstance(node, dict):
             continue
-        db_name = citation.get("database_name")
-        accession = citation.get("accession")
-        if (
-            isinstance(db_name, str)
-            and "CATH" in db_name.upper()
-            and isinstance(accession, str)
-            and accession.strip() == target
+        lineage_id = node.get("id")
+        if isinstance(lineage_id, str) and lineage_id.strip() == target:
+            return True
+        lineage_name = node.get("name")
+        if isinstance(lineage_name, str) and target in lineage_name:
+            return True
+
+    properties = feature.get("additional_properties") or []
+    for prop in properties:
+        if not isinstance(prop, dict):
+            continue
+        values = prop.get("values")
+        if isinstance(values, list) and any(
+            isinstance(val, str) and target == val.strip() for val in values
         ):
             return True
 
