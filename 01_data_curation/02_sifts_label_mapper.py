@@ -59,29 +59,31 @@ def build_graphql_query() -> str:
     """Return the GraphQL query for fetching polymer entity instances."""
 
     return (
-        "query($entry_id: String!) {\n"
-        "  entry(entry_id: $entry_id) {\n"
-        "    polymer_entity_instances {\n"
-        "      rcsb_polymer_entity_instance_container_identifiers {\n"
-        "        auth_asym_id\n"
-        "        label_asym_id\n"
-        "        polymer_entity_id\n"
-        "      }\n"
-        "      rcsb_polymer_instance_feature {\n"
-        "        type\n"
-        "        name\n"
-        "        description\n"
-        "        provenance_source\n"
-        "        feature_id\n"
-        "        feature_positions {\n"
-        "          beg_seq_id\n"
-        "          beg_ins_code\n"
-        "          end_seq_id\n"
-        "          end_ins_code\n"
+        "query($entry_id: [String!]!) {\n"
+        "  entries(entry_ids: $entry_id) {\n"
+        "    polymer_entities {\n"
+        "      polymer_entity_instances {\n"
+        "        rcsb_polymer_entity_instance_container_identifiers {\n"
+        "          auth_asym_id\n"
+        "          label_asym_id\n"
+        "          polymer_entity_id\n"
         "        }\n"
-        "        related_database_citations {\n"
-        "          database_name\n"
-        "          accession\n"
+        "        rcsb_polymer_instance_feature {\n"
+        "          type\n"
+        "          name\n"
+        "          description\n"
+        "          provenance_source\n"
+        "          feature_id\n"
+        "          feature_positions {\n"
+        "            beg_seq_id\n"
+        "            beg_ins_code\n"
+        "            end_seq_id\n"
+        "            end_ins_code\n"
+        "          }\n"
+        "          related_database_citations {\n"
+        "            database_name\n"
+        "            accession\n"
+        "          }\n"
         "        }\n"
         "      }\n"
         "    }\n"
@@ -217,7 +219,7 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
 
     normalized_id = normalize_pdb_id(pdb_id)
     query = build_graphql_query()
-    payload = {"query": query, "variables": {"entry_id": normalized_id}}
+    payload = {"query": query, "variables": {"entry_id": [normalized_id]}}
 
     LOGGER.debug("GraphQL query payload: %s", json.dumps(payload, sort_keys=True))
 
@@ -245,19 +247,26 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
         raise RuntimeError("GraphQL response was not valid JSON") from exc
 
     if "errors" in payload and payload["errors"]:
-        first_error = payload["errors"][0]
-        message = first_error.get("message", "Unknown GraphQL error")
-        raise RuntimeError(f"GraphQL response contained errors: {message}")
+        messages = [err.get("message", "Unknown GraphQL error") for err in payload["errors"]]
+        LOGGER.debug("GraphQL errors for %s: %s", normalized_id, payload["errors"])
+        raise RuntimeError(
+            "GraphQL response contained errors: " + "; ".join(messages)
+        )
 
     data = payload.get("data")
     if not data or not isinstance(data, dict):
         raise RuntimeError("GraphQL response missing 'data' field")
 
-    entry = data.get("entry")
-    if not entry:
+    entries = data.get("entries")
+    if not entries:
         raise RuntimeError(f"Entry '{normalized_id}' was not found in RCSB data")
 
-    instances = entry.get("polymer_entity_instances")
+    instances: List[Dict[str, object]] = []
+    for entry in entries:
+        for entity in entry.get("polymer_entities") or []:
+            entity_instances = entity.get("polymer_entity_instances") or []
+            instances.extend(entity_instances)
+
     if not instances:
         raise RuntimeError(
             f"Entry '{normalized_id}' does not contain polymer entity instances"
