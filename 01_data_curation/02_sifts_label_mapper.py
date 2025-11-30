@@ -297,8 +297,10 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
                 if beg_seq is None or end_seq is None:
                     LOGGER.debug("Skipping malformed feature position: %s", pos)
                     continue
-                beg_ins = _extract_ins_code(beg_seq, pos.get("beg_ins_code"))
-                end_ins = _extract_ins_code(end_seq, pos.get("end_ins_code"))
+                # New API no longer returns insertion codes separately; derive from
+                # the sequence identifier if present.
+                beg_ins = _extract_ins_code(beg_seq, None)
+                end_ins = _extract_ins_code(end_seq, None)
                 positions.append((beg_seq, beg_ins, end_seq, end_ins))
 
             if not positions:
@@ -307,12 +309,13 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
             normalized_features.append(
                 {
                     "type": feature.get("type"),
+                    "feature_id": feature.get("feature_id"),
                     "name": feature.get("name"),
                     "description": feature.get("description"),
+                    "assignment_version": feature.get("assignment_version"),
                     "positions": positions,
-                    "related_database_citations": feature.get(
-                        "related_database_citations"
-                    )
+                    "annotation_lineage": feature.get("annotation_lineage") or [],
+                    "additional_properties": feature.get("additional_properties")
                     or [],
                 }
             )
@@ -348,17 +351,24 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     if isinstance(description, str) and target in description:
         return True
 
-    citations = feature.get("related_database_citations") or []
-    for citation in citations:
-        if not isinstance(citation, dict):
+    lineage = feature.get("annotation_lineage") or []
+    for node in lineage:
+        if not isinstance(node, dict):
             continue
-        db_name = citation.get("database_name")
-        accession = citation.get("accession")
-        if (
-            isinstance(db_name, str)
-            and "CATH" in db_name.upper()
-            and isinstance(accession, str)
-            and accession.strip() == target
+        lineage_id = node.get("id")
+        if isinstance(lineage_id, str) and lineage_id.strip() == target:
+            return True
+        lineage_name = node.get("name")
+        if isinstance(lineage_name, str) and target in lineage_name:
+            return True
+
+    properties = feature.get("additional_properties") or []
+    for prop in properties:
+        if not isinstance(prop, dict):
+            continue
+        values = prop.get("values")
+        if isinstance(values, list) and any(
+            isinstance(val, str) and target == val.strip() for val in values
         ):
             return True
 
