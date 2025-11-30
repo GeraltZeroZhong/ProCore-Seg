@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 from Bio.PDB import MMCIFParser, PDBParser
@@ -347,6 +348,7 @@ def compute_residue_osp(
             return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
 
+    shim = _ensure_os_create_folder_shim()
     try:
         raw_result = fibos_osp(str(structure_path))
     except Exception as exc:  # pragma: no cover - external tool failure
@@ -355,6 +357,8 @@ def compute_residue_osp(
             LOGGER.warning("%s; filling OSP with zeros", msg)
             return {}, "zero_fallback"
         raise RuntimeError(msg) from exc
+    finally:
+        shim.restore()
 
     osp_map: Dict[Tuple[str, int, str], float] = {}
     osp_source = "fibos"
@@ -421,7 +425,6 @@ def compute_residue_osp(
             for name, col in {
                 "chain": chain_col,
                 "resseq": resseq_col,
-                "icode": icode_col,
                 "osp": osp_col,
             }.items()
             if col is None
@@ -429,8 +432,9 @@ def compute_residue_osp(
         if required_missing:
             if allow_missing:
                 LOGGER.warning(
-                    "fibos.osp result missing columns %s; filling OSP with zeros",
+                    "fibos.osp result missing columns %s (available=%s); filling OSP with zeros",
                     ", ".join(required_missing),
+                    ", ".join(str(col) for col in df.columns),
                 )
                 return {}, "zero_fallback"
             raise RuntimeError(
@@ -458,10 +462,46 @@ def compute_residue_osp(
     return osp_map, osp_source
 
 
-def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
+class _OsCreateFolderShim:
+    """Context-style helper that temporarily injects ``os.create_folder``."""
+
+    def __init__(self, original: Optional[Callable[..., object]]) -> None:
+        self._original = original
+
+    def restore(self) -> None:
+        """Restore the original ``os.create_folder`` binding if it was absent."""
+
+        if self._original is not None:
+            return
+        try:
+            delattr(os, "create_folder")
+        except Exception:
+            LOGGER.debug("Unable to remove temporary os.create_folder shim")
+
+
+def _ensure_os_create_folder_shim() -> _OsCreateFolderShim:
+    """Install a minimal ``os.create_folder`` shim for fibos if missing."""
+
+    original = getattr(os, "create_folder", None)
+    if callable(original):
+        return _OsCreateFolderShim(original)
+
+    def _create_folder(path: str | Path, exist_ok: bool = True) -> None:
+        Path(path).mkdir(parents=True, exist_ok=exist_ok)
+
+    os.create_folder = _create_folder  # type: ignore[attr-defined]
+    LOGGER.debug("Installed temporary os.create_folder shim for fibos")
+    return _OsCreateFolderShim(None)
+
+
+def _first_present_column(columns: Sequence[object], candidates: Sequence[str]) -> str | None:
+    """Return the first column name matching any candidate (case-insensitive)."""
+
+    lowered_to_original = {str(col).lower(): str(col) for col in columns}
     for cand in candidates:
-        if cand in columns:
-            return cand
+        match = lowered_to_original.get(cand.lower())
+        if match is not None:
+            return match
     return None
 
 

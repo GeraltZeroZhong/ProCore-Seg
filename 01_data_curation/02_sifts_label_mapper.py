@@ -68,6 +68,14 @@ def build_graphql_query() -> str:
         "          asym_id\n"
         "          entity_id\n"
         "        }\n"
+        "        rcsb_polymer_instance_annotation {\n"
+        "          type\n"
+        "          provenance_source\n"
+        "          annotation_lineage {\n"
+        "            id\n"
+        "            name\n"
+        "          }\n"
+        "        }\n"
         "        rcsb_polymer_instance_feature {\n"
         "          type\n"
         "          name\n"
@@ -75,10 +83,6 @@ def build_graphql_query() -> str:
         "          provenance_source\n"
         "          feature_id\n"
         "          assignment_version\n"
-        "          annotation_lineage {\n"
-        "            id\n"
-        "            name\n"
-        "          }\n"
         "          additional_properties {\n"
         "            name\n"
         "            values\n"
@@ -93,6 +97,20 @@ def build_graphql_query() -> str:
         "  }\n"
         "}\n"
     )
+
+
+def _format_graphql_errors(errors: List[Dict[str, object]], pdb_id: str) -> str:
+    """Return a concise, user-facing summary of GraphQL errors."""
+
+    messages: List[str] = []
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        message = err.get("message")
+        if isinstance(message, str) and message.strip():
+            messages.append(message.strip())
+    summary = "; ".join(messages) if messages else "Unknown GraphQL error"
+    return f"GraphQL errors for {pdb_id}: {summary}"
 
 
 def _coerce_seq_id(value: object) -> Optional[str]:
@@ -218,7 +236,7 @@ def _iter_residue_positions(
 
 
 def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]]:
-    """Fetch polymer instance features for a PDB entry from RCSB GraphQL."""
+    """Fetch polymer instance annotations and features for a PDB entry."""
 
     normalized_id = normalize_pdb_id(pdb_id)
     query = build_graphql_query()
@@ -259,19 +277,17 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
 
     graphql_errors = payload.get("errors") or []
     if graphql_errors:
-        messages = [err.get("message", "Unknown GraphQL error") for err in graphql_errors]
         LOGGER.debug("GraphQL errors for %s: %s", normalized_id, graphql_errors)
-        LOGGER.warning(
-            "GraphQL errors for %s: %s", normalized_id, "; ".join(messages)
-        )
+        error_message = _format_graphql_errors(graphql_errors, normalized_id)
+        LOGGER.warning("%s", error_message)
+        data = payload.get("data")
+        if data:
+            raise RuntimeError(f"{error_message} (partial data returned)")
+        raise RuntimeError(f"{error_message}; no data returned")
 
     data = payload.get("data")
     if not data or not isinstance(data, dict):
-        raise RuntimeError(
-            "GraphQL response missing 'data' field" + (
-                "; errors present" if graphql_errors else ""
-            )
-        )
+        raise RuntimeError(f"GraphQL response missing data for {normalized_id}")
 
     entries = data.get("entries")
     if not entries:
@@ -301,6 +317,23 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
             )
             continue
 
+        raw_annotations = raw_instance.get("rcsb_polymer_instance_annotation") or []
+        annotations: List[Dict[str, object]] = []
+        for annotation in raw_annotations:
+            lineage_nodes: List[Dict[str, object]] = []
+            for node in annotation.get("annotation_lineage") or []:
+                if not isinstance(node, dict):
+                    continue
+                lineage_nodes.append({"id": node.get("id"), "name": node.get("name")})
+
+            annotations.append(
+                {
+                    "type": annotation.get("type"),
+                    "provenance_source": annotation.get("provenance_source"),
+                    "annotation_lineage": lineage_nodes,
+                }
+            )
+
         raw_features = raw_instance.get("rcsb_polymer_instance_feature") or []
         normalized_features: List[Dict[str, object]] = []
 
@@ -325,9 +358,8 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
             normalized_features.append(
                 {
                     "type": feature.get("type"),
+                    "provenance_source": feature.get("provenance_source"),
                     "feature_id": feature.get("feature_id"),
-                    "annotation_id": feature.get("annotation_id"),
-                    "annotation_lineage_id": feature.get("annotation_lineage_id"),
                     "name": feature.get("name"),
                     "description": feature.get("description"),
                     "assignment_version": feature.get("assignment_version"),
@@ -340,6 +372,7 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
         normalized_instances.append(
             {
                 "auth_asym_id": str(auth_asym_id),
+                "annotations": annotations,
                 "features": normalized_features,
             }
         )
@@ -362,15 +395,53 @@ def dump_instance_debug(payload: List[Dict[str, object]], out_path: Path) -> Non
     LOGGER.info("Wrote raw feature payload to %s", out_path)
 
 
-def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: str) -> bool:
-    """Check if a feature matches the target CATH superfamily."""
+def _annotation_matches_superfamily(
+    annotation: Dict[str, object], cath_superfamily: Optional[str]
+) -> bool:
+    """Return ``True`` when annotation lineage matches the target CATH id."""
 
-    target = cath_superfamily.strip()
+    if annotation.get("type") != "CATH":
+        return False
+
+    if annotation.get("provenance_source") != "CATH":
+        return False
+
+    target = cath_superfamily.strip() if cath_superfamily else ""
+    if not target:
+        return True
+
+    for node in annotation.get("annotation_lineage") or []:
+        if not isinstance(node, dict):
+            continue
+        lineage_id = node.get("id")
+        if isinstance(lineage_id, str):
+            value = lineage_id.strip()
+            if value == target or value.startswith(target):
+                return True
+
+    return False
+
+
+def _feature_matches_superfamily(
+    feature: Dict[str, object], cath_superfamily: Optional[str]
+) -> bool:
+    """Check if a feature aligns with the target CATH superfamily."""
+
+    if feature.get("type") != "CATH":
+        return False
+
+    if feature.get("provenance_source") != "CATH":
+        return False
+
+    target = cath_superfamily.strip() if cath_superfamily else ""
     if not target:
         return True
 
     def _matches_text(value: object) -> bool:
-        return isinstance(value, str) and target in value
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        return text == target or text.startswith(target) or target in text
 
     if _matches_text(feature.get("name")):
         return True
@@ -381,23 +452,6 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     if _matches_text(feature.get("feature_id")):
         return True
 
-    if _matches_text(feature.get("annotation_id")):
-        return True
-
-    if _matches_text(feature.get("annotation_lineage_id")):
-        return True
-
-    lineage = feature.get("annotation_lineage") or []
-    for node in lineage:
-        if not isinstance(node, dict):
-            continue
-        lineage_id = node.get("id")
-        if isinstance(lineage_id, str) and lineage_id.strip() == target:
-            return True
-        lineage_name = node.get("name")
-        if isinstance(lineage_name, str) and target in lineage_name:
-            return True
-
     properties = feature.get("additional_properties") or []
     for prop in properties:
         if not isinstance(prop, dict):
@@ -406,7 +460,7 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
             return True
         values = prop.get("values")
         if isinstance(values, list) and any(
-            isinstance(val, str) and target == val.strip() for val in values
+            isinstance(val, str) and _matches_text(val) for val in values
         ):
             return True
 
@@ -424,13 +478,22 @@ def filter_cath_features(
         if not isinstance(auth_asym_id, str):
             continue
 
+        annotations = instance.get("annotations") or []
+        annotation_match = any(
+            _annotation_matches_superfamily(annotation, cath_superfamily)
+            for annotation in annotations
+        )
+
         features = instance.get("features") or []
         for feature in features:
             if feature.get("type") != "CATH":
                 continue
 
-            if cath_superfamily and not _feature_matches_superfamily(
-                feature, cath_superfamily
+            if feature.get("provenance_source") != "CATH":
+                continue
+
+            if cath_superfamily and not (
+                annotation_match or _feature_matches_superfamily(feature, cath_superfamily)
             ):
                 continue
 
