@@ -495,7 +495,10 @@ def _ensure_os_create_folder_shim() -> _OsCreateFolderShim:
     return _OsCreateFolderShim(None)
 
 
-def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
+def _first_present_column(columns: Sequence[object], candidates: Sequence[str]) -> str | None:
+    """Return the first column name matching any candidate (case-insensitive)."""
+
+    lowered_to_original = {str(col).lower(): str(col) for col in columns}
     for cand in candidates:
         match = lowered_to_original.get(cand.lower())
         if match is not None:
@@ -527,14 +530,20 @@ def _call_fibos_osp(
     """
 
     kwargs: Dict[str, object] = {}
+    prot_name = structure_path.stem
     try:
         if "prot_name" in inspect.signature(fibos_osp).parameters:
-            kwargs["prot_name"] = structure_path.stem
+            kwargs["prot_name"] = prot_name
     except (TypeError, ValueError):  # pragma: no cover - built-in/partial callable
         pass
 
     try:
         return fibos_osp(str(structure_path), **kwargs)
+    except UnboundLocalError:
+        LOGGER.debug(
+            "Retrying fibos.osp with prot_name after UnboundLocalError for %s", structure_path
+        )
+        return fibos_osp(str(structure_path), prot_name=prot_name)
     except TypeError as exc:
         if kwargs:
             LOGGER.debug(
