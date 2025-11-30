@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
 import os
+import shutil
+import tempfile
+import urllib.error
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-from Bio.PDB import MMCIFParser, PDBParser
+from Bio.PDB import MMCIFParser, PDBIO, PDBParser
 from Bio.PDB.Atom import Atom
 from Bio.PDB.Structure import Structure
 from Bio.PDB.SASA import ShrakeRupley
@@ -334,6 +338,59 @@ def compute_residue_sasa(
     return sasa_map
 
 
+def _prepare_structure_for_fibos(
+    structure_path: Path, structure: Structure
+) -> tuple[Path, Callable[[], None]]:
+    """Return a PDB path suitable for fibos and a cleanup callback.
+
+    fibos expects either a 4-letter PDB identifier or a valid local PDB file
+    path. This helper ensures we always provide the latter by:
+
+    * returning the original path when it already points to a PDB file,
+    * inflating ``.pdb.gz`` inputs to a temporary ``.pdb`` in the same folder,
+    * exporting mmCIF inputs to a temporary PDB using :class:`Bio.PDB.PDBIO`.
+
+    The accompanying cleanup callable removes any temporary artefacts so callers
+    can safely invoke it in a ``finally`` block.
+    """
+
+    suffixes = "".join(structure_path.suffixes).lower()
+
+    def _noop_cleanup() -> None:
+        return None
+
+    if suffixes.endswith(".pdb"):
+        return structure_path, _noop_cleanup
+
+    parent_dir = structure_path.parent
+
+    if suffixes.endswith(".pdb.gz"):
+        with gzip.open(structure_path, "rt") as src:
+            with tempfile.NamedTemporaryFile(
+                "w", delete=False, suffix=".pdb", dir=parent_dir
+            ) as handle:
+                shutil.copyfileobj(src, handle)
+                temp_path = Path(handle.name)
+
+        def _cleanup() -> None:
+            temp_path.unlink(missing_ok=True)
+
+        return temp_path, _cleanup
+
+    with tempfile.NamedTemporaryFile(
+        "w", delete=False, suffix=".pdb", dir=parent_dir
+    ) as handle:
+        temp_path = Path(handle.name)
+        io = PDBIO()
+        io.set_structure(structure)
+        io.save(str(temp_path))
+
+    def _cleanup() -> None:
+        temp_path.unlink(missing_ok=True)
+
+    return temp_path, _cleanup
+
+
 def compute_residue_osp(
     structure_path: Path, allow_missing: bool, default_chain_id: str | None = None
 ) -> Tuple[Dict[Tuple[str, int, str], float], str]:
@@ -348,6 +405,12 @@ def compute_residue_osp(
     default_chain_id:
         Fallback chain identifier to use when the fibos result omits chain
         information (e.g., when processing single-chain structures).
+
+    Callers should provide a real PDB filepath (see
+    :func:`_prepare_structure_for_fibos`) so fibos does not attempt to invent
+    paths such as ``pdb/<absolute>.ent``. When remote downloads fail (e.g., HTTP
+    errors) and ``allow_missing`` is set, the OSP channel is filled with zeros
+    while the pipeline continues.
     """
 
     try:
@@ -570,6 +633,16 @@ def _ensure_fibos_srf_file(
         result = _call_fibos_occluded_surface(
             occluded_surface, structure_path, srf_path.parent
         )
+    except urllib.error.HTTPError as exc:  # pragma: no cover - network dependent
+        status = getattr(exc, "code", None)
+        pdb_id = structure_path.stem[:4].upper()
+        msg = (
+            f"fibos.occluded_surface HTTP {status or 'error'} when fetching {pdb_id}"
+        )
+        if allow_missing:
+            LOGGER.warning("%s; filling OSP with zeros", msg)
+            return None
+        raise RuntimeError(msg) from exc
     except Exception as exc:  # pragma: no cover - external tool failure
         msg = f"fibos.occluded_surface failed for {structure_path}: {exc}"
         if allow_missing:
@@ -652,9 +725,17 @@ def build_arrays(
     sasa_map = compute_residue_sasa(structure, probe_radius, n_points)
     chain_ids = {chain_id for _, chain_id, _, _ in atoms_info}
     default_chain_id = next(iter(chain_ids)) if len(chain_ids) == 1 else None
-    osp_map, osp_source = compute_residue_osp(
-        structure_path, allow_missing_density, default_chain_id=default_chain_id
+    fibos_structure_path, cleanup_fibos = _prepare_structure_for_fibos(
+        structure_path, structure
     )
+    try:
+        osp_map, osp_source = compute_residue_osp(
+            fibos_structure_path,
+            allow_missing_density,
+            default_chain_id=default_chain_id,
+        )
+    finally:
+        cleanup_fibos()
 
     n_atoms = len(atoms_info)
     coords = np.empty((n_atoms, 3), dtype=np.float32)
