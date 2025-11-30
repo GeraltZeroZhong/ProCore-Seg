@@ -494,10 +494,7 @@ def _ensure_os_create_folder_shim() -> _OsCreateFolderShim:
     return _OsCreateFolderShim(None)
 
 
-def _first_present_column(columns: Sequence[object], candidates: Sequence[str]) -> str | None:
-    """Return the first column name matching any candidate (case-insensitive)."""
-
-    lowered_to_original = {str(col).lower(): str(col) for col in columns}
+def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
     for cand in candidates:
         match = lowered_to_original.get(cand.lower())
         if match is not None:
