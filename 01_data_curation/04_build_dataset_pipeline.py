@@ -138,12 +138,19 @@ def load_config_from_cli(argv: Sequence[str] | None = None) -> PipelineConfig:
 
 
 def discover_ids_and_paths(raw_dir: Path, ids_file: Path | None) -> Dict[str, Path]:
-    """Discover structure paths for PDB identifiers."""
+    """Discover structure paths for PDB identifiers.
+
+    Local structures are preferred over remote downloads and the selection order
+    prioritises PDB files (``.pdb``/``.pdb.gz``) before mmCIF counterparts to
+    maximise compatibility with downstream tooling (e.g., fibos). If only mmCIF
+    files are present they will still be used directly rather than triggering a
+    fresh download.
+    """
 
     if not raw_dir.exists():
         raise FileNotFoundError(f"Raw directory does not exist: {raw_dir}")
 
-    preferred_suffixes = [".cif.gz", ".cif", ".pdb.gz", ".pdb"]
+    preferred_suffixes = [".pdb", ".pdb.gz", ".cif", ".cif.gz"]
 
     discovered: Dict[str, Dict[str, Path]] = {}
 
@@ -194,14 +201,14 @@ def best_structure_path(raw_dir: Path, pdb_id: str) -> Path | None:
 
     pdb_id = pdb_id.strip().lower()
     candidates = [
-        raw_dir / f"{pdb_id}.cif.gz",
-        raw_dir / f"{pdb_id}.cif",
-        raw_dir / f"{pdb_id}.pdb.gz",
         raw_dir / f"{pdb_id}.pdb",
-        raw_dir / f"{pdb_id.upper()}.cif.gz",
-        raw_dir / f"{pdb_id.upper()}.cif",
-        raw_dir / f"{pdb_id.upper()}.pdb.gz",
+        raw_dir / f"{pdb_id}.pdb.gz",
+        raw_dir / f"{pdb_id}.cif",
+        raw_dir / f"{pdb_id}.cif.gz",
         raw_dir / f"{pdb_id.upper()}.pdb",
+        raw_dir / f"{pdb_id.upper()}.pdb.gz",
+        raw_dir / f"{pdb_id.upper()}.cif",
+        raw_dir / f"{pdb_id.upper()}.cif.gz",
     ]
     for candidate in candidates:
         if candidate.exists():
