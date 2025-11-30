@@ -74,6 +74,11 @@ def build_graphql_query() -> str:
         "          description\n"
         "          provenance_source\n"
         "          feature_id\n"
+        "          assignment_version\n"
+        "          additional_properties {\n"
+        "            name\n"
+        "            values\n"
+        "          }\n"
         "          feature_positions {\n"
         "            beg_seq_id\n"
         "            end_seq_id\n"
@@ -248,19 +253,21 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
         LOGGER.warning("GraphQL response was not valid JSON for %s", normalized_id)
         raise RuntimeError("GraphQL response was not valid JSON") from exc
 
-    if "errors" in payload and payload["errors"]:
-        messages = [err.get("message", "Unknown GraphQL error") for err in payload["errors"]]
-        LOGGER.debug("GraphQL errors for %s: %s", normalized_id, payload["errors"])
+    graphql_errors = payload.get("errors") or []
+    if graphql_errors:
+        messages = [err.get("message", "Unknown GraphQL error") for err in graphql_errors]
+        LOGGER.debug("GraphQL errors for %s: %s", normalized_id, graphql_errors)
         LOGGER.warning(
             "GraphQL errors for %s: %s", normalized_id, "; ".join(messages)
-        )
-        raise RuntimeError(
-            "GraphQL response contained errors: " + "; ".join(messages)
         )
 
     data = payload.get("data")
     if not data or not isinstance(data, dict):
-        raise RuntimeError("GraphQL response missing 'data' field")
+        raise RuntimeError(
+            "GraphQL response missing 'data' field" + (
+                "; errors present" if graphql_errors else ""
+            )
+        )
 
     entries = data.get("entries")
     if not entries:
@@ -315,11 +322,12 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
                 {
                     "type": feature.get("type"),
                     "feature_id": feature.get("feature_id"),
+                    "annotation_id": feature.get("annotation_id"),
+                    "annotation_lineage_id": feature.get("annotation_lineage_id"),
                     "name": feature.get("name"),
                     "description": feature.get("description"),
                     "assignment_version": feature.get("assignment_version"),
                     "positions": positions,
-                    "annotation_lineage": feature.get("annotation_lineage") or [],
                     "additional_properties": feature.get("additional_properties")
                     or [],
                 }
@@ -341,6 +349,15 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
     return normalized_instances
 
 
+def dump_instance_debug(payload: List[Dict[str, object]], out_path: Path) -> None:
+    """Persist normalized instance features for debugging."""
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    LOGGER.info("Wrote raw feature payload to %s", out_path)
+
+
 def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: str) -> bool:
     """Check if a feature matches the target CATH superfamily."""
 
@@ -348,12 +365,22 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     if not target:
         return True
 
-    name = feature.get("name")
-    if isinstance(name, str) and target in name:
+    def _matches_text(value: object) -> bool:
+        return isinstance(value, str) and target in value
+
+    if _matches_text(feature.get("name")):
         return True
 
-    description = feature.get("description")
-    if isinstance(description, str) and target in description:
+    if _matches_text(feature.get("description")):
+        return True
+
+    if _matches_text(feature.get("feature_id")):
+        return True
+
+    if _matches_text(feature.get("annotation_id")):
+        return True
+
+    if _matches_text(feature.get("annotation_lineage_id")):
         return True
 
     lineage = feature.get("annotation_lineage") or []
@@ -371,6 +398,8 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     for prop in properties:
         if not isinstance(prop, dict):
             continue
+        if _matches_text(prop.get("name")):
+            return True
         values = prop.get("values")
         if isinstance(values, list) and any(
             isinstance(val, str) and target == val.strip() for val in values
@@ -415,6 +444,13 @@ def filter_cath_features(
 
             cath_ranges.setdefault(auth_asym_id, []).extend(valid_positions)
 
+        if not cath_superfamily and features:
+            LOGGER.debug(
+                "Instance %s retained %d CATH features (no superfamily filter)",
+                auth_asym_id,
+                len(features),
+            )
+
     def _range_sort_key(span: Tuple[str, str, str, str]) -> Tuple[object, ...]:
         beg_seq, beg_ins, end_seq, end_ins = span
         beg_num = _extract_seq_number(beg_seq)
@@ -434,6 +470,11 @@ def filter_cath_features(
         result.append((auth_asym_id, sorted_ranges))
 
     result.sort(key=lambda item: item[0])
+    LOGGER.debug(
+        "Retained CATH annotations for %d instance(s) after filtering on %s",
+        len(result),
+        cath_superfamily or "any",
+    )
     return result
 
 
@@ -521,6 +562,10 @@ def main() -> int:
     parser.add_argument("--cath-superfamily", help="CATH superfamily identifier to filter on")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout for GraphQL requests (seconds)")
     parser.add_argument(
+        "--debug-dump",
+        help="Optional path to write the raw normalized GraphQL payload for inspection",
+    )
+    parser.add_argument(
         "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level"
     )
 
@@ -531,6 +576,8 @@ def main() -> int:
     try:
         normalized_id = normalize_pdb_id(args.pdb_id)
         instances = fetch_instance_features(normalized_id, args.timeout)
+        if args.debug_dump:
+            dump_instance_debug(instances, Path(args.debug_dump))
         cath_features = filter_cath_features(instances, args.cath_superfamily)
         mapping = expand_ranges_to_map(cath_features)
 
