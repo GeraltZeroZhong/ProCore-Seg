@@ -425,7 +425,6 @@ def compute_residue_osp(
             for name, col in {
                 "chain": chain_col,
                 "resseq": resseq_col,
-                "icode": icode_col,
                 "osp": osp_col,
             }.items()
             if col is None
@@ -433,8 +432,9 @@ def compute_residue_osp(
         if required_missing:
             if allow_missing:
                 LOGGER.warning(
-                    "fibos.osp result missing columns %s; filling OSP with zeros",
+                    "fibos.osp result missing columns %s (available=%s); filling OSP with zeros",
                     ", ".join(required_missing),
+                    ", ".join(str(col) for col in df.columns),
                 )
                 return {}, "zero_fallback"
             raise RuntimeError(
@@ -496,8 +496,9 @@ def _ensure_os_create_folder_shim() -> _OsCreateFolderShim:
 
 def _first_present_column(columns: Sequence[str], candidates: Sequence[str]) -> str | None:
     for cand in candidates:
-        if cand in columns:
-            return cand
+        match = lowered_to_original.get(cand.lower())
+        if match is not None:
+            return match
     return None
 
 
