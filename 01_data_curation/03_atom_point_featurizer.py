@@ -6,6 +6,7 @@ import argparse
 import gzip
 import json
 import logging
+import math
 import multiprocessing
 import os
 import shutil
@@ -430,10 +431,19 @@ def _sanitize_pdb_for_fibos(structure_path: Path) -> tuple[Path, Callable[[], No
                 try:
                     int(serial_field)
                     int(resseq_field)
-                    float(line[30:38])
-                    float(line[38:46])
-                    float(line[46:54])
+                    x = float(line[30:38])
+                    y = float(line[38:46])
+                    z = float(line[46:54])
+                    occ = float(line[54:60])
+                    bfactor = float(line[60:66])
                 except ValueError:
+                    removed += 1
+                    continue
+
+                if not all(
+                    math.isfinite(value)
+                    for value in (x, y, z, occ, bfactor)
+                ):
                     removed += 1
                     continue
 
