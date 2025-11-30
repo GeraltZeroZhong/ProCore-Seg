@@ -65,8 +65,8 @@ def build_graphql_query() -> str:
         "      polymer_entity_instances {\n"
         "        rcsb_polymer_entity_instance_container_identifiers {\n"
         "          auth_asym_id\n"
-        "          label_asym_id\n"
-        "          polymer_entity_id\n"
+        "          asym_id\n"
+        "          entity_id\n"
         "        }\n"
         "        rcsb_polymer_instance_feature {\n"
         "          type\n"
@@ -76,13 +76,7 @@ def build_graphql_query() -> str:
         "          feature_id\n"
         "          feature_positions {\n"
         "            beg_seq_id\n"
-        "            beg_ins_code\n"
         "            end_seq_id\n"
-        "            end_ins_code\n"
-        "          }\n"
-        "          related_database_citations {\n"
-        "            database_name\n"
-        "            accession\n"
         "          }\n"
         "        }\n"
         "      }\n"
@@ -226,6 +220,7 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
     try:
         response = requests.post(GRAPHQL_ENDPOINT, json=payload, timeout=timeout)
     except requests.RequestException as exc:  # pragma: no cover - network failure
+        LOGGER.warning("GraphQL request failed for %s: %s", normalized_id, exc)
         raise RuntimeError(f"GraphQL request failed: {exc}") from exc
 
     request_id = None
@@ -237,6 +232,12 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
         LOGGER.debug("GraphQL request id: %s", request_id)
 
     if response.status_code != requests.codes.ok:
+        LOGGER.warning(
+            "GraphQL request failed for %s with status %s: %s",
+            normalized_id,
+            response.status_code,
+            response.text,
+        )
         raise RuntimeError(
             f"GraphQL request failed with status {response.status_code}: {response.text}"
         )
@@ -244,11 +245,15 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
     try:
         payload = response.json()
     except ValueError as exc:
+        LOGGER.warning("GraphQL response was not valid JSON for %s", normalized_id)
         raise RuntimeError("GraphQL response was not valid JSON") from exc
 
     if "errors" in payload and payload["errors"]:
         messages = [err.get("message", "Unknown GraphQL error") for err in payload["errors"]]
         LOGGER.debug("GraphQL errors for %s: %s", normalized_id, payload["errors"])
+        LOGGER.warning(
+            "GraphQL errors for %s: %s", normalized_id, "; ".join(messages)
+        )
         raise RuntimeError(
             "GraphQL response contained errors: " + "; ".join(messages)
         )
