@@ -336,9 +336,20 @@ def compute_residue_sasa(
 
 
 def compute_residue_osp(
-    structure_path: Path, allow_missing: bool
+    structure_path: Path, allow_missing: bool, default_chain_id: str | None = None
 ) -> Tuple[Dict[Tuple[str, int, str], float], str]:
-    """Compute residue packing density using fibos OSP."""
+    """Compute residue packing density using fibos OSP.
+
+    Parameters
+    ----------
+    structure_path:
+        Path to the structure file passed to fibos.
+    allow_missing:
+        Whether failures should fall back to zero-valued densities.
+    default_chain_id:
+        Fallback chain identifier to use when the fibos result omits chain
+        information (e.g., when processing single-chain structures).
+    """
 
     try:
         from fibos import osp as fibos_osp
@@ -414,22 +425,20 @@ def compute_residue_osp(
         )
         resseq_col = _first_present_column(
             df.columns,
-            ["resseq", "auth_seq_id", "seq_id", "residue_number", "res_id"],
+            ["resseq", "auth_seq_id", "seq_id", "residue_number", "res_id", "resnum"],
         )
         icode_col = _first_present_column(
             df.columns, ["icode", "ins_code", "insertion_code", "auth_ins_code"]
         )
         osp_col = _first_present_column(df.columns, ["osp", "density", "packing_density"])
 
-        required_missing = [
-            name
-            for name, col in {
-                "chain": chain_col,
-                "resseq": resseq_col,
-                "osp": osp_col,
-            }.items()
-            if col is None
-        ]
+        required_missing = []
+        if chain_col is None and default_chain_id is None:
+            required_missing.append("chain")
+        if resseq_col is None:
+            required_missing.append("resseq")
+        if osp_col is None:
+            required_missing.append("osp")
         if required_missing:
             if allow_missing:
                 LOGGER.warning(
@@ -443,7 +452,10 @@ def compute_residue_osp(
             )
 
         for _, row in df.iterrows():
-            chain_id = str(row[chain_col])
+            if chain_col is not None:
+                chain_id = str(row[chain_col])
+            else:
+                chain_id = default_chain_id
             try:
                 resseq = _normalize_resseq(row[resseq_col])
             except StructureParsingError:
@@ -549,7 +561,10 @@ def _call_fibos_osp(
             LOGGER.debug(
                 "Retrying fibos.osp without keyword args after TypeError: %s", exc
             )
-            return fibos_osp(str(structure_path))
+            try:
+                return fibos_osp(str(structure_path))
+            except TypeError as exc2:
+                raise exc2 from exc
         raise
 
 
@@ -569,7 +584,11 @@ def build_arrays(
         raise RuntimeError("No heavy atoms were found in the structure")
 
     sasa_map = compute_residue_sasa(structure, probe_radius, n_points)
-    osp_map, osp_source = compute_residue_osp(structure_path, allow_missing_density)
+    chain_ids = {chain_id for _, chain_id, _, _ in atoms_info}
+    default_chain_id = next(iter(chain_ids)) if len(chain_ids) == 1 else None
+    osp_map, osp_source = compute_residue_osp(
+        structure_path, allow_missing_density, default_chain_id=default_chain_id
+    )
 
     n_atoms = len(atoms_info)
     coords = np.empty((n_atoms, 3), dtype=np.float32)
