@@ -257,19 +257,21 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
         LOGGER.warning("GraphQL response was not valid JSON for %s", normalized_id)
         raise RuntimeError("GraphQL response was not valid JSON") from exc
 
-    if "errors" in payload and payload["errors"]:
-        messages = [err.get("message", "Unknown GraphQL error") for err in payload["errors"]]
-        LOGGER.debug("GraphQL errors for %s: %s", normalized_id, payload["errors"])
+    graphql_errors = payload.get("errors") or []
+    if graphql_errors:
+        messages = [err.get("message", "Unknown GraphQL error") for err in graphql_errors]
+        LOGGER.debug("GraphQL errors for %s: %s", normalized_id, graphql_errors)
         LOGGER.warning(
             "GraphQL errors for %s: %s", normalized_id, "; ".join(messages)
-        )
-        raise RuntimeError(
-            "GraphQL response contained errors: " + "; ".join(messages)
         )
 
     data = payload.get("data")
     if not data or not isinstance(data, dict):
-        raise RuntimeError("GraphQL response missing 'data' field")
+        raise RuntimeError(
+            "GraphQL response missing 'data' field" + (
+                "; errors present" if graphql_errors else ""
+            )
+        )
 
     entries = data.get("entries")
     if not entries:
@@ -324,11 +326,12 @@ def fetch_instance_features(pdb_id: str, timeout: int) -> List[Dict[str, object]
                 {
                     "type": feature.get("type"),
                     "feature_id": feature.get("feature_id"),
+                    "annotation_id": feature.get("annotation_id"),
+                    "annotation_lineage_id": feature.get("annotation_lineage_id"),
                     "name": feature.get("name"),
                     "description": feature.get("description"),
                     "assignment_version": feature.get("assignment_version"),
                     "positions": positions,
-                    "annotation_lineage": feature.get("annotation_lineage") or [],
                     "additional_properties": feature.get("additional_properties")
                     or [],
                 }
@@ -366,12 +369,22 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     if not target:
         return True
 
-    name = feature.get("name")
-    if isinstance(name, str) and target in name:
+    def _matches_text(value: object) -> bool:
+        return isinstance(value, str) and target in value
+
+    if _matches_text(feature.get("name")):
         return True
 
-    description = feature.get("description")
-    if isinstance(description, str) and target in description:
+    if _matches_text(feature.get("description")):
+        return True
+
+    if _matches_text(feature.get("feature_id")):
+        return True
+
+    if _matches_text(feature.get("annotation_id")):
+        return True
+
+    if _matches_text(feature.get("annotation_lineage_id")):
         return True
 
     lineage = feature.get("annotation_lineage") or []
@@ -389,6 +402,8 @@ def _feature_matches_superfamily(feature: Dict[str, object], cath_superfamily: s
     for prop in properties:
         if not isinstance(prop, dict):
             continue
+        if _matches_text(prop.get("name")):
+            return True
         values = prop.get("values")
         if isinstance(values, list) and any(
             isinstance(val, str) and target == val.strip() for val in values
