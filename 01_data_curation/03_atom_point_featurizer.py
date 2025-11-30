@@ -6,6 +6,7 @@ import argparse
 import gzip
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import urllib.error
@@ -644,8 +645,8 @@ def _ensure_fibos_srf_file(
 
     srf_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        result = _call_fibos_occluded_surface(
-            occluded_surface, structure_path, srf_path.parent, prot_name
+        result = _call_fibos_occluded_surface_sandboxed(
+            structure_path, srf_path.parent, prot_name
         )
     except urllib.error.HTTPError as exc:  # pragma: no cover - network dependent
         status = getattr(exc, "code", None)
@@ -688,12 +689,7 @@ def _call_fibos_occluded_surface(
     out_dir: Path,
     prot_name: str,
 ) -> object:
-    """Call ``fibos.occluded_surface`` with best-effort signature detection.
-
-    The helper prefers signatures that accept an explicit ``file_path`` so fibos
-    uses the on-disk PDB we prepared rather than constructing ``<prot>.pdb`` in
-    the current working directory.
-    """
+    """Call ``fibos.occluded_surface`` with best-effort signature detection."""
 
     try:
         return occluded_surface(
@@ -718,6 +714,86 @@ def _call_fibos_occluded_surface(
                     )
                 except TypeError:
                     return occluded_surface(str(structure_path))
+
+
+def _call_fibos_occluded_surface_sandboxed(
+    structure_path: Path,
+    out_dir: Path,
+    prot_name: str,
+    *,
+    timeout: float | None = None,
+) -> object:
+    """Call ``fibos.occluded_surface`` in a child process to isolate crashes.
+
+    fibos wraps Fortran code that can terminate the interpreter on malformed
+    input. Running the computation in a dedicated process ensures that we can
+    detect non-zero exit codes or other fatal errors and fall back to neutral
+    OSP values without killing the caller.
+    """
+
+    ctx = multiprocessing.get_context("fork")
+    result_queue: multiprocessing.Queue = ctx.Queue()  # type: ignore[var-annotated]
+
+    worker = ctx.Process(
+        target=_fibos_occluded_surface_worker,
+        args=(structure_path, out_dir, prot_name, result_queue),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(timeout)
+
+    if worker.is_alive():
+        worker.terminate()
+        worker.join()
+        raise RuntimeError(
+            "fibos.occluded_surface exceeded time limit and was terminated"
+        )
+
+    exit_code = worker.exitcode
+    try:
+        payload = result_queue.get_nowait()
+    except Exception:  # pragma: no cover - defensive guard
+        payload = None
+
+    if exit_code is None:
+        raise RuntimeError("fibos.occluded_surface subprocess ended unexpectedly")
+    if exit_code != 0:
+        details = ""
+        if isinstance(payload, dict) and payload.get("error"):
+            details = f": {payload['error']}"
+        raise RuntimeError(
+            f"fibos.occluded_surface subprocess exited with code {exit_code}{details}"
+        )
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("fibos.occluded_surface subprocess returned no result")
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error", "unknown fibos error"))
+
+    return payload.get("result")
+
+
+def _fibos_occluded_surface_worker(
+    structure_path: Path,
+    out_dir: Path,
+    prot_name: str,
+    result_queue: multiprocessing.Queue,
+) -> None:
+    """Invoke fibos.occluded_surface and report success/failure through a queue."""
+
+    try:
+        import fibos  # type: ignore
+
+        occluded_surface = getattr(fibos, "occluded_surface", None)
+        if not callable(occluded_surface):
+            raise RuntimeError("fibos.occluded_surface is unavailable")
+
+        result = _call_fibos_occluded_surface(
+            occluded_surface, structure_path, out_dir, prot_name
+        )
+        result_queue.put({"ok": True, "result": result})
+    except Exception as exc:  # pragma: no cover - defensive
+        result_queue.put({"ok": False, "error": repr(exc)})
 
 
 def _call_fibos_osp(
