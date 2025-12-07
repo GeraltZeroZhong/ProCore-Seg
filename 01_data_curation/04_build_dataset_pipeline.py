@@ -671,6 +671,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOGGER.error("No structures found to process")
         return 1
 
+    import importlib.util
+
+    module_path = Path(__file__).resolve().parent / "02_sifts_label_mapper.py"
+    spec = importlib.util.spec_from_file_location("_sifts_label_mapper", module_path)
+    if spec is None or spec.loader is None:
+        LOGGER.error("Unable to load SIFTS helper for connectivity check")
+        return 1
+    _sifts_label_mapper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(_sifts_label_mapper)  # type: ignore[arg-type]
+
+    try:
+        _sifts_label_mapper.assert_graphql_reachable(config.timeout)
+    except Exception as exc:
+        LOGGER.error(
+            "SIFTS GraphQL endpoint is not reachable: %s. Aborting early to avoid per-entry timeouts.",
+            exc,
+        )
+        return 1
+
     items = sorted(id_path_map.items())
     total = len(items)
     results: List[Dict[str, object]] = []

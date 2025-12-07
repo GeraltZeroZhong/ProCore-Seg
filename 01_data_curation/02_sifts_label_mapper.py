@@ -99,6 +99,23 @@ def build_graphql_query() -> str:
     )
 
 
+def assert_graphql_reachable(timeout: int) -> None:
+    """Raise :class:`RuntimeError` if the RCSB GraphQL endpoint is unreachable."""
+
+    probe_timeout = max(1, min(timeout, 5))
+    try:
+        response = requests.head(GRAPHQL_ENDPOINT, timeout=probe_timeout)
+    except requests.RequestException as exc:  # pragma: no cover - network failure
+        raise RuntimeError(
+            "Unable to reach RCSB GraphQL endpoint; check network/proxy settings"
+        ) from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"RCSB GraphQL endpoint responded with status {response.status_code}"
+        )
+
+
 def _format_graphql_errors(errors: List[Dict[str, object]], pdb_id: str) -> str:
     """Return a concise, user-facing summary of GraphQL errors."""
 
